@@ -529,3 +529,26 @@ app.get('/my-active-shifts-v2', auth, async (req, res) => {
     res.json(result.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+app.post('/containers/checkin/v2', auth, async (req, res) => {
+  try {
+    const { shift_id, container_number, container_size } = req.body;
+    const existing = await pool.query(
+      `SELECT * FROM containers 
+       WHERE shift_id=$1 AND container_size=$2 AND status='planned' AND employee_id IS NULL
+       LIMIT 1`,
+      [shift_id, container_size]
+    );
+    if (existing.rows.length === 0) {
+      return res.status(400).json({ error: 'No available container of this size for this shift' });
+    }
+    const container = existing.rows[0];
+    const result = await pool.query(
+      `UPDATE containers SET 
+        employee_id=$1, container_number=$2, status='checked_in', checkin_time=NOW()
+       WHERE id=$3 RETURNING *`,
+      [req.user.id, container_number, container.id]
+    );
+    res.json(result.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
