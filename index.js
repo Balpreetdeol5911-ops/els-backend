@@ -498,3 +498,12 @@ app.get('/warehouses/:id', auth, async (req, res) => {
     res.json(result.rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+app.delete('/shifts/:id/force', auth, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM containers WHERE shift_id=$1', [req.params.id]);
+    await pool.query('DELETE FROM shift_assignments WHERE shift_id=$1', [req.params.id]);
+    await pool.query('DELETE FROM shifts WHERE id=$1', [req.params.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
