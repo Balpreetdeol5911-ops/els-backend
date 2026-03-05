@@ -577,3 +577,55 @@ app.get('/shifts/:id/containers/v2', auth, async (req, res) => {
     res.json(result.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+app.get('/admin/dashboard', auth, async (req, res) => {
+  try {
+    const activeContainers = await pool.query(
+      `SELECT c.*, u.name as employee_name, w.name as warehouse_name
+       FROM containers c
+       LEFT JOIN users u ON c.employee_id = u.id
+       LEFT JOIN shifts s ON c.shift_id = s.id
+       LEFT JOIN warehouses w ON s.warehouse_id = w.id
+       WHERE c.status IN ('checked_in', 'in_progress')
+       ORDER BY c.checkin_time DESC`
+    );
+    const weeklyStats = await pool.query(
+      `SELECT 
+        COUNT(DISTINCT c.employee_id) as employees_worked,
+        COUNT(c.id) as containers_completed,
+        COALESCE(SUM(CASE WHEN c.status='completed' THEN c.total_earning::numeric ELSE 0 END), 0) as total_earned,
+        COALESCE(SUM(CASE WHEN c.status='completed' AND (c.payment_status IS NULL OR c.payment_status != 'paid') THEN c.total_earning::numeric ELSE 0 END), 0) as total_unpaid
+       FROM containers c
+       WHERE c.created_at >= NOW() - INTERVAL '7 days'`
+    );
+    const todayShifts = await pool.query(
+      `SELECT s.*, w.name as warehouse_name, w.address as warehouse_address,
+              COUNT(sa.id) as employee_count
+       FROM shifts s
+       LEFT JOIN warehouses w ON s.warehouse_id = w.id
+       LEFT JOIN shift_assignments sa ON sa.shift_id = s.id AND sa.status = 'confirmed'
+       WHERE DATE(s.shift_date) = CURRENT_DATE
+       GROUP BY s.id, w.name, w.address
+       ORDER BY s.start_time ASC`
+    );
+    const topEarners = await pool.query(
+      `SELECT u.name, u.id,
+              COALESCE(SUM(c.total_earning::numeric), 0) as total_earned,
+              COUNT(c.id) as containers_done
+       FROM users u
+       LEFT JOIN containers c ON c.employee_id = u.id
+         AND c.created_at >= NOW() - INTERVAL '7 days'
+         AND c.status = 'completed'
+       WHERE u.role = 'employee'
+       GROUP BY u.id, u.name
+       ORDER BY total_earned DESC
+       LIMIT 5`
+    );
+    res.json({
+      active_containers: activeContainers.rows,
+      weekly_stats: weeklyStats.rows[0],
+      today_shifts: todayShifts.rows,
+      top_earners: topEarners.rows
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
