@@ -242,7 +242,11 @@ app.post('/shifts/:id/containers', auth, async (req, res) => {
 app.get('/shifts/:id/containers', auth, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT c.*, u.name as employee_name FROM containers c LEFT JOIN users u ON c.employee_id = u.id WHERE c.shift_id = $1 ORDER BY c.created_at ASC',
+      `SELECT c.*, u.name as employee_name FROM containers c 
+       LEFT JOIN users u ON c.employee_id = u.id 
+       WHERE c.shift_id = $1 
+       AND NOT (c.status = 'completed' AND c.employee_id != ${req.user.id} AND NOT (c.co_worker_ids @> ARRAY[${req.user.id}]::integer[]))
+       ORDER BY c.created_at ASC`,
       [req.params.id]
     );
     res.json(result.rows);
@@ -550,5 +554,26 @@ app.post('/containers/checkin/v2', auth, async (req, res) => {
       [req.user.id, container_number, container.id]
     );
     res.json(result.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/shifts/:id/containers/v2', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const result = await pool.query(
+      `SELECT c.*, u.name as employee_name 
+       FROM containers c 
+       LEFT JOIN users u ON c.employee_id = u.id 
+       WHERE c.shift_id = $1
+       AND (
+         c.status = 'planned'
+         OR c.employee_id = $2
+         OR (c.co_worker_ids IS NOT NULL AND $2 = ANY(c.co_worker_ids))
+         OR (c.status != 'completed' AND c.employee_id IS NOT NULL)
+       )
+       ORDER BY c.created_at ASC`,
+      [req.params.id, userId]
+    );
+    res.json(result.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
