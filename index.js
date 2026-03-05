@@ -222,3 +222,58 @@ app.delete('/shifts/:id', auth, async (req, res) => {
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+app.post('/shifts/:id/containers', auth, async (req, res) => {
+  try {
+    const { containers } = req.body;
+    const shiftId = req.params.id;
+    const inserted = [];
+    for (const c of containers) {
+      const result = await pool.query(
+        'INSERT INTO containers (shift_id, container_number, container_size, status) VALUES ($1, $2, $3, $4) RETURNING *',
+        [shiftId, c.container_number, c.container_size, 'planned']
+      );
+      inserted.push(result.rows[0]);
+    }
+    res.json(inserted);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/shifts/:id/containers', auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT c.*, u.name as employee_name FROM containers c LEFT JOIN users u ON c.employee_id = u.id WHERE c.shift_id = $1 ORDER BY c.created_at ASC',
+      [req.params.id]
+    );
+    res.json(result.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/shifts/:id/containers', auth, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM containers WHERE shift_id = $1 AND status = $2', [req.params.id, 'planned']);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/shifts/:id/details', auth, async (req, res) => {
+  try {
+    const shift = await pool.query(
+      'SELECT s.*, w.name as warehouse_name FROM shifts s LEFT JOIN warehouses w ON s.warehouse_id = w.id WHERE s.id = $1',
+      [req.params.id]
+    );
+    const employees = await pool.query(
+      'SELECT u.id, u.name, u.email, u.phone, sa.status FROM shift_assignments sa JOIN users u ON sa.employee_id = u.id WHERE sa.shift_id = $1',
+      [req.params.id]
+    );
+    const containers = await pool.query(
+      'SELECT c.*, u.name as employee_name FROM containers c LEFT JOIN users u ON c.employee_id = u.id WHERE c.shift_id = $1 ORDER BY c.created_at ASC',
+      [req.params.id]
+    );
+    res.json({
+      shift: shift.rows[0],
+      employees: employees.rows,
+      containers: containers.rows
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
