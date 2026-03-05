@@ -277,3 +277,112 @@ app.get('/shifts/:id/details', auth, async (req, res) => {
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+app.put('/users/:id/banking', auth, async (req, res) => {
+  try {
+    const { sin_number, bank_account, bank_transit, bank_institution, address, city, province, postal_code } = req.body;
+    const result = await pool.query(
+      `UPDATE users SET 
+        sin_number=$1, bank_account=$2, bank_transit=$3, 
+        bank_institution=$4, address=$5, city=$6, 
+        province=$7, postal_code=$8 
+       WHERE id=$9 RETURNING *`,
+      [sin_number, bank_account, bank_transit, bank_institution, address, city, province, postal_code, req.params.id]
+    );
+    res.json(result.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/payroll/mark-paid', auth, async (req, res) => {
+  try {
+    const { employee_id, week_start, week_end, total_amount, payment_method, notes } = req.body;
+    const result = await pool.query(
+      `INSERT INTO payroll_records (employee_id, week_start, week_end, total_amount, payment_method, notes, paid_at)
+       VALUES ($1,$2,$3,$4,$5,$6,NOW()) RETURNING *`,
+      [employee_id, week_start, week_end, total_amount, payment_method || 'direct_deposit', notes || '']
+    );
+    await pool.query(
+      `UPDATE containers SET payment_status='paid', payroll_id=$1 
+       WHERE employee_id=$2 AND created_at >= $3 AND created_at <= $4 AND status='completed'`,
+      [result.rows[0].id, employee_id, week_start, week_end]
+    );
+    res.json(result.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/payroll/weekly', auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT 
+        u.id, u.name, u.email, u.phone,
+        u.sin_number, u.bank_account, u.bank_transit, 
+        u.bank_institution, u.address, u.city, u.province, u.postal_code,
+        COUNT(c.id) as container_count,
+        SUM(CASE WHEN c.total_earning IS NOT NULL THEN c.total_earning::numeric ELSE 0 END) as total_earned,
+        SUM(CASE WHEN c.payment_status = 'paid' AND c.total_earning IS NOT NULL THEN c.total_earning::numeric ELSE 0 END) as total_paid,
+        SUM(CASE WHEN (c.payment_status IS NULL OR c.payment_status != 'paid') AND c.status='completed' AND c.total_earning IS NOT NULL THEN c.total_earning::numeric ELSE 0 END) as total_unpaid
+       FROM users u
+       LEFT JOIN containers c ON c.employee_id = u.id 
+         AND c.created_at >= NOW() - INTERVAL '7 days'
+       WHERE u.role = 'employee'
+       GROUP BY u.id, u.name, u.email, u.phone, u.sin_number, 
+                u.bank_account, u.bank_transit, u.bank_institution, 
+                u.address, u.city, u.province, u.postal_code`
+    );
+    res.json(result.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/payroll/history/:employee_id', auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM payroll_records WHERE employee_id=$1 ORDER BY paid_at DESC`,
+      [req.params.employee_id]
+    );
+    res.json(result.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/earnings/detail/:employee_id', auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT c.*, s.shift_date, w.name as warehouse_name 
+       FROM containers c
+       LEFT JOIN shifts s ON c.shift_id = s.id
+       LEFT JOIN warehouses w ON s.warehouse_id = w.id
+       WHERE c.employee_id = $1
+       ORDER BY c.created_at DESC`,
+      [req.params.employee_id]
+    );
+    res.json(result.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+async function updateDBSchema() {
+  try {
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS sin_number VARCHAR(255)`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS bank_account VARCHAR(255)`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS bank_transit VARCHAR(255)`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS bank_institution VARCHAR(255)`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS address VARCHAR(255)`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS city VARCHAR(255)`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS province VARCHAR(50)`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS postal_code VARCHAR(20)`);
+    await pool.query(`ALTER TABLE containers ADD COLUMN IF NOT EXISTS payment_status VARCHAR(50) DEFAULT 'unpaid'`);
+    await pool.query(`ALTER TABLE containers ADD COLUMN IF NOT EXISTS payroll_id INTEGER`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS payroll_records (
+        id SERIAL PRIMARY KEY,
+        employee_id INTEGER,
+        week_start DATE,
+        week_end DATE,
+        total_amount DECIMAL DEFAULT 0,
+        payment_method VARCHAR(50) DEFAULT 'direct_deposit',
+        notes TEXT,
+        paid_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    console.log('DB schema updated');
+  } catch (e) { console.log('Schema update error:', e.message); }
+}
+updateDBSchema();
