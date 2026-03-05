@@ -491,3 +491,10 @@ app.put('/containers/:id/checkout/v2', auth, async (req, res) => {
     res.json({ ...result.rows[0], total_earning: totalPerWorker.toFixed(2), worker_count: workerCount, total_before_split: totalBeforeSplit.toFixed(2) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+app.get('/warehouses/:id', auth, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM warehouses WHERE id=$1', [req.params.id]);
+    res.json(result.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
