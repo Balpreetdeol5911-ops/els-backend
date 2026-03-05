@@ -170,10 +170,10 @@ app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
 app.put('/warehouses/:id', auth, async (req, res) => {
   try {
-    const { name, address, base_pay_20ft, base_pay_40ft, base_pay_45ft, base_pay_53ft, piece_bonus, sku_bonus, wait_time_pay } = req.body;
+    const { name, address, base_pay_20ft, base_pay_40ft, base_pay_45ft, base_pay_53ft, piece_bonus, sku_bonus, wait_time_pay, piece_bonus_min, sku_bonus_min } = req.body;
     const result = await pool.query(
-      'UPDATE warehouses SET name=$1, address=$2, base_pay_20ft=$3, base_pay_40ft=$4, base_pay_45ft=$5, base_pay_53ft=$6, piece_bonus=$7, sku_bonus=$8, wait_time_pay=$9 WHERE id=$10 RETURNING *',
-      [name, address, base_pay_20ft||0, base_pay_40ft||0, base_pay_45ft||0, base_pay_53ft||0, piece_bonus||0, sku_bonus||0, wait_time_pay||0, req.params.id]
+      'UPDATE warehouses SET name=$1, address=$2, base_pay_20ft=$3, base_pay_40ft=$4, base_pay_45ft=$5, base_pay_53ft=$6, piece_bonus=$7, sku_bonus=$8, wait_time_pay=$9, piece_bonus_min=$10, sku_bonus_min=$11 WHERE id=$12 RETURNING *',
+      [name, address, base_pay_20ft||0, base_pay_40ft||0, base_pay_45ft||0, base_pay_53ft||0, piece_bonus||0, sku_bonus||0, wait_time_pay||0, piece_bonus_min||0, sku_bonus_min||0, req.params.id]
     );
     res.json(result.rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
