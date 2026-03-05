@@ -386,3 +386,14 @@ async function updateDBSchema() {
   } catch (e) { console.log('Schema update error:', e.message); }
 }
 updateDBSchema();
+
+app.put('/shift-assignments/:shift_id/respond', auth, async (req, res) => {
+  try {
+    const { status } = req.body;
+    const result = await pool.query(
+      'UPDATE shift_assignments SET status=$1 WHERE shift_id=$2 AND employee_id=$3 RETURNING *',
+      [status, req.params.shift_id, req.user.id]
+    );
+    res.json(result.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
