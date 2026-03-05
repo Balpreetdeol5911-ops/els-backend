@@ -507,3 +507,25 @@ app.delete('/shifts/:id/force', auth, async (req, res) => {
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+app.get('/my-active-shifts-v2', auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT s.*, w.name as warehouse_name, w.address as warehouse_address,
+              sa.status as assignment_status,
+              COUNT(c.id) as total_containers,
+              COUNT(CASE WHEN c.status = 'completed' THEN 1 END) as completed_containers
+       FROM shifts s
+       JOIN shift_assignments sa ON sa.shift_id = s.id AND sa.employee_id = $1
+       JOIN warehouses w ON s.warehouse_id = w.id
+       LEFT JOIN containers c ON c.shift_id = s.id
+       WHERE sa.status != 'rejected'
+       GROUP BY s.id, w.name, w.address, sa.status
+       HAVING COUNT(c.id) = 0
+          OR COUNT(CASE WHEN c.status != 'completed' THEN 1 END) > 0
+       ORDER BY s.shift_date DESC`,
+      [req.user.id]
+    );
+    res.json(result.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
