@@ -167,3 +167,58 @@ app.get('/admin/containers', auth, async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+app.put('/warehouses/:id', auth, async (req, res) => {
+  try {
+    const { name, address, base_pay_20ft, base_pay_40ft, base_pay_45ft, base_pay_53ft, piece_bonus, sku_bonus, wait_time_pay } = req.body;
+    const result = await pool.query(
+      'UPDATE warehouses SET name=$1, address=$2, base_pay_20ft=$3, base_pay_40ft=$4, base_pay_45ft=$5, base_pay_53ft=$6, piece_bonus=$7, sku_bonus=$8, wait_time_pay=$9 WHERE id=$10 RETURNING *',
+      [name, address, base_pay_20ft||0, base_pay_40ft||0, base_pay_45ft||0, base_pay_53ft||0, piece_bonus||0, sku_bonus||0, wait_time_pay||0, req.params.id]
+    );
+    res.json(result.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/warehouses/:id', auth, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM warehouses WHERE id=$1', [req.params.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/users/:id', auth, async (req, res) => {
+  try {
+    const { name, email, phone } = req.body;
+    const result = await pool.query(
+      'UPDATE users SET name=$1, email=$2, phone=$3 WHERE id=$4 RETURNING *',
+      [name, email, phone, req.params.id]
+    );
+    res.json(result.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/users/:id', auth, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM users WHERE id=$1', [req.params.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/shifts/:id', auth, async (req, res) => {
+  try {
+    const { warehouse_id, shift_date, start_time, notes } = req.body;
+    const result = await pool.query(
+      'UPDATE shifts SET warehouse_id=$1, shift_date=$2, start_time=$3, notes=$4 WHERE id=$5 RETURNING *',
+      [warehouse_id, shift_date, start_time, notes, req.params.id]
+    );
+    res.json(result.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/shifts/:id', auth, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM shift_assignments WHERE shift_id=$1', [req.params.id]);
+    await pool.query('DELETE FROM shifts WHERE id=$1', [req.params.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
