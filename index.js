@@ -166,6 +166,21 @@ app.get('/admin/containers', auth, async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+
+app.get('/shifts/completed', auth, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT s.*, w.name as warehouse_name, w.address as warehouse_address, COUNT(c.id)::text as total_containers, COUNT(CASE WHEN c.status=$1 THEN 1 END)::text as completed_containers FROM shifts s LEFT JOIN warehouses w ON s.warehouse_id = w.id LEFT JOIN containers c ON c.shift_id = s.id GROUP BY s.id, w.name, w.address HAVING COUNT(c.id) > 0 AND COUNT(c.id) = COUNT(CASE WHEN c.status=$1 THEN 1 END) ORDER BY s.shift_date DESC LIMIT 50', ['completed']);
+    res.json(result.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/earnings/detail/:employeeId', auth, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT c.id, c.container_number, c.container_size, c.status, c.total_earning, c.total_pieces, c.sku_count, c.payment_status, c.checkin_time, c.checkout_time, c.actual_start_time, c.actual_end_time, c.hours_worked, c.wait_time, c.total_before_split, c.worker_count, s.shift_date, w.name as warehouse_name, w.address as warehouse_address FROM containers c JOIN shifts s ON c.shift_id = s.id JOIN warehouses w ON s.warehouse_id = w.id WHERE c.employee_id=$1 AND c.status=$2 ORDER BY c.checkout_time DESC', [req.params.employeeId, 'completed']);
+    res.json(result.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
 app.put('/warehouses/:id', auth, async (req, res) => {
@@ -442,59 +457,53 @@ app.get('/containers/:id/workers', auth, async (req, res) => {
 
 app.put('/containers/:id/checkout/v2', auth, async (req, res) => {
   try {
-    const { total_pieces, sku_count } = req.body;
-    const container = await pool.query(
-      `SELECT c.*, w.base_pay_20ft, w.base_pay_40ft, w.base_pay_45ft, w.base_pay_53ft,
-              w.piece_bonus, w.sku_bonus, w.wait_time_pay,
-              w.piece_bonus_min, w.sku_bonus_min
-       FROM containers c
-       JOIN shifts s ON c.shift_id = s.id
-       JOIN warehouses w ON s.warehouse_id = w.id
-       WHERE c.id = $1`,
-      [req.params.id]
-    );
-    const c = container.rows[0];
-    const sizePayMap = {
-      '20ft': parseFloat(c.base_pay_20ft || 0),
-      '40ft': parseFloat(c.base_pay_40ft || 0),
-      '45ft': parseFloat(c.base_pay_45ft || 0),
-      '53ft': parseFloat(c.base_pay_53ft || 0)
-    };
-    const basePay = sizePayMap[c.container_size] || 0;
-    const pieceBonusMin = parseInt(c.piece_bonus_min || 0);
-    const skuBonusMin = parseInt(c.sku_bonus_min || 0);
-    const pieces = parseInt(total_pieces || 0);
-    const skus = parseInt(sku_count || 0);
-    const piecePay = pieces > pieceBonusMin ? parseFloat(c.piece_bonus || 0) * pieces : 0;
-    const skuPay = skus > skuBonusMin ? parseFloat(c.sku_bonus || 0) * skus : 0;
-    const waitPay = parseFloat(c.wait_time_pay || 0) * parseInt(c.wait_time || 0);
-    const workerCount = parseInt(c.worker_count || 1);
-    const totalBeforeSplit = basePay + piecePay + skuPay + waitPay;
+    const { total_pieces, sku_count, actual_start_time, actual_end_time } = req.body;
+    const containerId = req.params.id;
+    const contResult = await pool.query('SELECT * FROM containers WHERE id=$1', [containerId]);
+    if (contResult.rows.length === 0) return res.status(404).json({ error: 'Container not found' });
+    const container = contResult.rows[0];
+    const shiftResult = await pool.query('SELECT s.*, w.base_pay_20ft, w.base_pay_40ft, w.base_pay_45ft, w.base_pay_53ft, w.piece_bonus, w.sku_bonus, w.wait_time_pay, w.piece_bonus_min, w.sku_bonus_min FROM shifts s JOIN warehouses w ON s.warehouse_id = w.id WHERE s.id=$1', [container.shift_id]);
+    if (shiftResult.rows.length === 0) return res.status(404).json({ error: 'Shift not found' });
+    const shift = shiftResult.rows[0];
+    const size = container.container_size;
+    let basePay = 0;
+    if (size === '20ft') basePay = parseFloat(shift.base_pay_20ft) || 0;
+    else if (size === '40ft') basePay = parseFloat(shift.base_pay_40ft) || 0;
+    else if (size === '45ft') basePay = parseFloat(shift.base_pay_45ft) || 0;
+    else if (size === '53ft') basePay = parseFloat(shift.base_pay_53ft) || 0;
+    const pieceBonusMin = parseInt(shift.piece_bonus_min) || 0;
+    const skuBonusMin = parseInt(shift.sku_bonus_min) || 0;
+    const pieceBonus = (parseInt(total_pieces) > pieceBonusMin) ? (parseFloat(shift.piece_bonus) || 0) : 0;
+    const skuBonus = (parseInt(sku_count) > skuBonusMin) ? (parseFloat(shift.sku_bonus) || 0) : 0;
+    const waitTimePay = (container.wait_time > 0) ? ((parseFloat(shift.wait_time_pay) || 0) * container.wait_time / 60) : 0;
+    const totalBeforeSplit = basePay + pieceBonus + skuBonus + waitTimePay;
+    const workerCount = container.worker_count || 1;
     const totalPerWorker = totalBeforeSplit / workerCount;
-    const result = await pool.query(
-      `UPDATE containers SET
-        checkout_time=NOW(), end_time=NOW(),
-        total_pieces=$1, sku_count=$2,
-        total_earning=$3, status='completed'
-       WHERE id=$4 RETURNING *`,
-      [pieces, skus, totalPerWorker.toFixed(2), req.params.id]
-    );
-    if (c.co_worker_ids && c.co_worker_ids.length > 0) {
-      for (const coWorkerId of c.co_worker_ids) {
-        await pool.query(
-          `INSERT INTO containers (shift_id, employee_id, container_number, container_size,
-            checkin_time, start_time, checkout_time, end_time,
-            total_pieces, sku_count, total_earning, status, worker_count)
-           VALUES ($1,$2,$3,$4,$5,$6,NOW(),NOW(),$7,$8,$9,'completed',$10)`,
-          [c.shift_id, coWorkerId, c.container_number, c.container_size,
-           c.checkin_time, c.start_time, pieces, skus,
-           totalPerWorker.toFixed(2), workerCount]
-        );
+    let hoursWorked = null;
+    if (actual_start_time && actual_end_time) {
+      const start = new Date('1970-01-01T' + actual_start_time);
+      const end = new Date('1970-01-01T' + actual_end_time);
+      hoursWorked = (end - start) / (1000 * 60 * 60);
+      if (hoursWorked < 0) hoursWorked += 24;
+    }
+    try {
+      await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS actual_start_time VARCHAR(20)');
+      await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS actual_end_time VARCHAR(20)');
+      await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS hours_worked DECIMAL(5,2)');
+    } catch(e) {}
+    await pool.query('UPDATE containers SET status=$1, checkout_time=NOW(), total_pieces=$2, sku_count=$3, total_earning=$4, total_before_split=$5, payment_status=$6, actual_start_time=$7, actual_end_time=$8, hours_worked=$9 WHERE id=$10',
+      ['completed', total_pieces, sku_count, totalPerWorker.toFixed(2), totalBeforeSplit.toFixed(2), 'unpaid', actual_start_time, actual_end_time, hoursWorked, containerId]);
+    if (container.co_worker_ids && container.co_worker_ids.length > 0) {
+      for (const coWorkerId of container.co_worker_ids) {
+        await pool.query('UPDATE containers SET total_earning=$1, total_before_split=$2, payment_status=$3, actual_start_time=$4, actual_end_time=$5, hours_worked=$6 WHERE shift_id=$7 AND employee_id=$8 AND container_number=$9 AND id!=$10',
+          [totalPerWorker.toFixed(2), totalBeforeSplit.toFixed(2), 'unpaid', actual_start_time, actual_end_time, hoursWorked, container.shift_id, coWorkerId, container.container_number, containerId]);
       }
     }
-    res.json({ ...result.rows[0], total_earning: totalPerWorker.toFixed(2), worker_count: workerCount, total_before_split: totalBeforeSplit.toFixed(2) });
+    const updated = await pool.query('SELECT * FROM containers WHERE id=$1', [containerId]);
+    res.json(updated.rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
 
 app.get('/warehouses/:id', auth, async (req, res) => {
   try {
