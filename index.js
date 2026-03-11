@@ -505,7 +505,7 @@ app.get('/warehouses/:id', auth, async (req, res) => {
 
 app.delete('/shifts/:id/force', auth, async (req, res) => {
   try {
-    await pool.query('DELETE FROM containers WHERE shift_id=$1', [req.params.id]);
+    await pool.query("DELETE FROM containers WHERE shift_id=$1 AND status='planned'", [req.params.id]);
     await pool.query('DELETE FROM shift_assignments WHERE shift_id=$1', [req.params.id]);
     await pool.query('DELETE FROM shifts WHERE id=$1', [req.params.id]);
     res.json({ success: true });
@@ -627,5 +627,25 @@ app.get('/admin/dashboard', auth, async (req, res) => {
       today_shifts: todayShifts.rows,
       top_earners: topEarners.rows
     });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/shifts/completed', auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT s.*, w.name as warehouse_name,
+              COUNT(c.id) as total_containers,
+              COUNT(CASE WHEN c.status='completed' THEN 1 END) as completed_containers
+       FROM shifts s
+       LEFT JOIN warehouses w ON s.warehouse_id = w.id
+       LEFT JOIN containers c ON c.shift_id = s.id
+       GROUP BY s.id, w.name
+       HAVING COUNT(c.id) > 0 
+          AND COUNT(c.id) = COUNT(CASE WHEN c.status='completed' THEN 1 END)
+       ORDER BY s.shift_date DESC
+       LIMIT 30`,
+      []
+    );
+    res.json(result.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
