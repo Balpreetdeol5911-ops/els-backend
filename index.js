@@ -181,6 +181,16 @@ app.get('/earnings/detail/:employeeId', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+
+app.get('/admin/migrate-columns', async (req, res) => {
+  try {
+    await pool.query(`ALTER TABLE containers ADD COLUMN IF NOT EXISTS total_before_split DECIMAL(10,2)`);
+    await pool.query(`ALTER TABLE containers ADD COLUMN IF NOT EXISTS actual_start_time VARCHAR(20)`);
+    await pool.query(`ALTER TABLE containers ADD COLUMN IF NOT EXISTS actual_end_time VARCHAR(20)`);
+    await pool.query(`ALTER TABLE containers ADD COLUMN IF NOT EXISTS hours_worked DECIMAL(5,2)`);
+    res.json({ success: true, message: 'Columns added!' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
 app.put('/warehouses/:id', auth, async (req, res) => {
