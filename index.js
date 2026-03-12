@@ -191,6 +191,56 @@ app.get('/admin/migrate-columns', async (req, res) => {
     res.json({ success: true, message: 'Columns added!' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+app.get('/admin/employees', auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT id, name, email, role, phone, sin_number, bank_account, bank_transit, bank_institution, address, city, province, postal_code FROM users WHERE role = 'employee' ORDER BY name"
+    );
+    res.json(result.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/admin/employees', auth, async (req, res) => {
+  try {
+    const { name, email, password, phone } = req.body;
+    const hashed = await bcrypt.hash(password, 10);
+    const result = await pool.query(
+      'INSERT INTO users (name, email, password, role, phone) VALUES ($1, $2, $3, $4, $5) RETURNING id, name, email, role, phone',
+      [name, email, hashed, 'employee', phone]
+    );
+    res.json(result.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/admin/employees/:id', auth, async (req, res) => {
+  try {
+    const { name, email, phone } = req.body;
+    const result = await pool.query(
+      'UPDATE users SET name=$1, email=$2, phone=$3 WHERE id=$4 RETURNING id, name, email, role, phone',
+      [name, email, phone, req.params.id]
+    );
+    res.json(result.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/admin/employees/:id/banking', auth, async (req, res) => {
+  try {
+    const { sin_number, bank_account, bank_transit, bank_institution, address, city, province, postal_code } = req.body;
+    const result = await pool.query(
+      'UPDATE users SET sin_number=$1, bank_account=$2, bank_transit=$3, bank_institution=$4, address=$5, city=$6, province=$7, postal_code=$8 WHERE id=$9 RETURNING *',
+      [sin_number, bank_account, bank_transit, bank_institution, address, city, province, postal_code, req.params.id]
+    );
+    res.json(result.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/admin/employees/:id', auth, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM users WHERE id=$1', [req.params.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
 app.put('/warehouses/:id', auth, async (req, res) => {
