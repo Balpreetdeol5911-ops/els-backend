@@ -1,0 +1,144 @@
+const express = require('express');
+const { Pool } = require('pg');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const cors = require('cors');
+require('dotenv').config();
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+const JWT_SECRET = process.env.JWT_SECRET || 'elsapp2024secretkey';
+
+async function setupDB() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE, password VARCHAR(255), role VARCHAR(50), phone VARCHAR(50), sin_number VARCHAR(255), bank_account VARCHAR(255), bank_transit VARCHAR(255), bank_institution VARCHAR(255), address VARCHAR(255), city VARCHAR(255), province VARCHAR(50), postal_code VARCHAR(20), created_at TIMESTAMP DEFAULT NOW());
+      CREATE TABLE IF NOT EXISTS warehouses (id SERIAL PRIMARY KEY, name VARCHAR(255), address TEXT, base_pay_20ft DECIMAL DEFAULT 0, base_pay_40ft DECIMAL DEFAULT 0, base_pay_45ft DECIMAL DEFAULT 0, base_pay_53ft DECIMAL DEFAULT 0, piece_bonus DECIMAL DEFAULT 0, sku_bonus DECIMAL DEFAULT 0, wait_time_pay DECIMAL DEFAULT 0, piece_bonus_min INTEGER DEFAULT 0, sku_bonus_min INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT NOW());
+      CREATE TABLE IF NOT EXISTS shifts (id SERIAL PRIMARY KEY, warehouse_id INTEGER, shift_date DATE, start_time TIME, notes TEXT, created_at TIMESTAMP DEFAULT NOW());
+      CREATE TABLE IF NOT EXISTS shift_assignments (id SERIAL PRIMARY KEY, shift_id INTEGER, employee_id INTEGER, status VARCHAR(50) DEFAULT 'pending', created_at TIMESTAMP DEFAULT NOW());
+      CREATE TABLE IF NOT EXISTS containers (id SERIAL PRIMARY KEY, shift_id INTEGER, employee_id INTEGER, container_number VARCHAR(255), container_size VARCHAR(10) DEFAULT '40ft', checkin_time TIMESTAMP, checkout_time TIMESTAMP, start_time TIMESTAMP, end_time TIMESTAMP, wait_time INTEGER DEFAULT 0, total_pieces INTEGER DEFAULT 0, sku_count INTEGER DEFAULT 0, total_earning DECIMAL DEFAULT 0, total_before_split DECIMAL(10,2) DEFAULT 0, payment_status VARCHAR(50) DEFAULT 'unpaid', payroll_id INTEGER, worker_count INTEGER DEFAULT 1, co_worker_ids INTEGER[], actual_start_time VARCHAR(20), actual_end_time VARCHAR(20), hours_worked DECIMAL(5,2), status VARCHAR(50) DEFAULT 'active', created_at TIMESTAMP DEFAULT NOW());
+      CREATE TABLE IF NOT EXISTS payroll_records (id SERIAL PRIMARY KEY, employee_id INTEGER, week_start DATE, week_end DATE, total_amount DECIMAL DEFAULT 0, payment_method VARCHAR(50) DEFAULT 'direct_deposit', notes TEXT, paid_at TIMESTAMP DEFAULT NOW());
+    `);
+    console.log('DB tables ready');
+  } catch (e) { console.log('DB setup error:', e.message); }
+}
+
+async function migrateDB() {
+  try {
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS sin_number VARCHAR(255)');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS bank_account VARCHAR(255)');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS bank_transit VARCHAR(255)');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS bank_institution VARCHAR(255)');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS address VARCHAR(255)');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS city VARCHAR(255)');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS province VARCHAR(50)');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS postal_code VARCHAR(20)');
+    await pool.query('ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS piece_bonus_min INTEGER DEFAULT 0');
+    await pool.query('ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS sku_bonus_min INTEGER DEFAULT 0');
+    await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS payment_status VARCHAR(50) DEFAULT \'unpaid\'');
+    await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS payroll_id INTEGER');
+    await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS worker_count INTEGER DEFAULT 1');
+    await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS co_worker_ids INTEGER[]');
+    await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS total_before_split DECIMAL(10,2)');
+    await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS actual_start_time VARCHAR(20)');
+    await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS actual_end_time VARCHAR(20)');
+    await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS hours_worked DECIMAL(5,2)');
+    console.log('DB migration complete');
+  } catch (e) { console.log('Migration error:', e.message); }
+}
+
+setupDB().then(() => migrateDB());
+
+function auth(req, res, next) {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'No token' });
+  try { req.user = jwt.verify(token, JWT_SECRET); next(); }
+  catch { res.status(401).json({ error: 'Invalid token' }); }
+}
+
+app.post('/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    if (!result.rows[0]) return res.status(401).json({ error: 'Invalid credentials' });
+    const valid = await bcrypt.compare(password, result.rows[0].password);
+    if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+    const token = jwt.sign({ id: result.rows[0].id, role: result.rows[0].role }, JWT_SECRET);
+    const { password: _, ...user } = result.rows[0];
+    res.json({ token, user });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/users', auth, async (req, res) => {
+  try {
+    const { name, email, password, phone } = req.body;
+    const hash = await bcrypt.hash(password, 10);
+    const result = await pool.query('INSERT INTO users (name, email, password, role, phone) VALUES ($1,$2,$3,$4,$5) RETURNING *', [name, email, hash, 'employee', phone]);
+    const { password: _, ...user } = result.rows[0];
+    res.json(user);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/users', auth, async (req, res) => {
+  try { res.json((await pool.query("SELECT id,name,email,role,phone FROM users WHERE role='employee'")).rows); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/users/:id', auth, async (req, res) => {
+  try {
+    const { name, email, phone } = req.body;
+    res.json((await pool.query('UPDATE users SET name=$1,email=$2,phone=$3 WHERE id=$4 RETURNING *', [name, email, phone, req.params.id])).rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/users/:id', auth, async (req, res) => {
+  try { await pool.query('DELETE FROM users WHERE id=$1', [req.params.id]); res.json({ success: true }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/users/:id/banking', auth, async (req, res) => {
+  try {
+    const { sin_number, bank_account, bank_transit, bank_institution, address, city, province, postal_code } = req.body;
+    res.json((await pool.query('UPDATE users SET sin_number=$1,bank_account=$2,bank_transit=$3,bank_institution=$4,address=$5,city=$6,province=$7,postal_code=$8 WHERE id=$9 RETURNING *', [sin_number, bank_account, bank_transit, bank_institution, address, city, province, postal_code, req.params.id])).rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/admin/employees', auth, async (req, res) => {
+  try { res.json((await pool.query("SELECT id,name,email,role,phone,sin_number,bank_account,bank_transit,bank_institution,address,city,province,postal_code FROM users WHERE role='employee' ORDER BY name")).rows); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/admin/employees', auth, async (req, res) => {
+  try {
+    const { name, email, password, phone } = req.body;
+    const hashed = await bcrypt.hash(password, 10);
+    res.json((await pool.query('INSERT INTO users (name,email,password,role,phone) VALUES ($1,$2,$3,$4,$5) RETURNING id,name,email,role,phone', [name, email, hashed, 'employee', phone])).rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/admin/employees/:id', auth, async (req, res) => {
+  try {
+    const { name, email, phone } = req.body;
+    res.json((await pool.query('UPDATE users SET name=$1,email=$2,phone=$3 WHERE id=$4 RETURNING id,name,email,role,phone', [name, email, phone, req.params.id])).rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/admin/employees/:id/banking', auth, async (req, res) => {
+  try {
+    const { sin_number, bank_account, bank_transit, bank_institution, address, city, province, postal_code } = req.body;
+    res.json((await pool.query('UPDATE users SET sin_number=$1,bank_account=$2,bank_transit=$3,bank_institution=$4,address=$5,city=$6,province=$7,postal_code=$8 WHERE id=$9 RETURNING *', [sin_number, bank_account, bank_transit, bank_institution, address, city, province, postal_code, req.params.id])).rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/admin/employees/:id', auth, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM containers WHERE employee_id=$1', [req.params.id]);
+    await pool.query('DELETE FROM shift_assignments WHERE employee_id=$1', [req.params.id]);
+    await pool.query('DELETE FROM payroll_records WHERE employee_id=$1', [req.params.id]);
+    await pool.query('DELETE FROM users WHERE id=$1', [req.params.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
