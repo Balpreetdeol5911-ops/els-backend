@@ -1,830 +1,615 @@
-const express = require('express');
-const { Pool } = require('pg');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const cors = require('cors');
-require('dotenv').config();
+// ELS Backend - index.js
+// Eastside Lumping Solutions - Complete Backend
+// Railway deployment: https://els-backend-production.up.railway.app
+
+const express = require("express");
+const { Pool } = require("pg");
+const cors = require("cors");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
-const JWT_SECRET = process.env.JWT_SECRET || 'elsapp2024secretkey';
 
-async function setupDB() {
+// ========================
+// DATABASE INITIALIZATION
+// ========================
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS employees (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      email TEXT,
+      phone TEXT,
+      role TEXT DEFAULT 'worker',
+      hourly_rate NUMERIC(10,2) DEFAULT 20.00,
+      status TEXT DEFAULT 'active',
+      sin_last4 TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS warehouses (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      address TEXT,
+      contact_name TEXT,
+      contact_email TEXT,
+      contact_phone TEXT,
+      default_rate NUMERIC(10,2) DEFAULT 55.00,
+      notes TEXT,
+      status TEXT DEFAULT 'active',
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS shifts (
+      id SERIAL PRIMARY KEY,
+      warehouse_id INTEGER REFERENCES warehouses(id),
+      date DATE NOT NULL,
+      start_time TEXT,
+      end_time TEXT,
+      status TEXT DEFAULT 'scheduled',
+      notes TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS shift_employees (
+      id SERIAL PRIMARY KEY,
+      shift_id INTEGER REFERENCES shifts(id) ON DELETE CASCADE,
+      employee_id INTEGER REFERENCES employees(id),
+      hours_worked NUMERIC(10,2),
+      status TEXT DEFAULT 'assigned',
+      check_in_time TIMESTAMP,
+      check_out_time TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS containers (
+      id SERIAL PRIMARY KEY,
+      container_number TEXT NOT NULL,
+      shift_id INTEGER REFERENCES shifts(id),
+      warehouse_id INTEGER REFERENCES warehouses(id),
+      status TEXT DEFAULT 'pending',
+      type TEXT,
+      notes TEXT,
+      assigned_at TIMESTAMP DEFAULT NOW(),
+      completed_at TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS invoices (
+      id SERIAL PRIMARY KEY,
+      warehouse_id INTEGER REFERENCES warehouses(id),
+      invoice_number TEXT UNIQUE NOT NULL,
+      date_issued DATE DEFAULT CURRENT_DATE,
+      due_date DATE,
+      subtotal NUMERIC(10,2) DEFAULT 0,
+      tax_rate NUMERIC(5,4) DEFAULT 0.05,
+      tax_amount NUMERIC(10,2) DEFAULT 0,
+      total NUMERIC(10,2) DEFAULT 0,
+      status TEXT DEFAULT 'draft',
+      notes TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS invoice_lines (
+      id SERIAL PRIMARY KEY,
+      invoice_id INTEGER REFERENCES invoices(id) ON DELETE CASCADE,
+      description TEXT NOT NULL,
+      quantity NUMERIC(10,2) DEFAULT 1,
+      unit_price NUMERIC(10,2) DEFAULT 0,
+      line_total NUMERIC(10,2) DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS time_off_requests (
+      id SERIAL PRIMARY KEY,
+      employee_id INTEGER REFERENCES employees(id),
+      start_date DATE NOT NULL,
+      end_date DATE NOT NULL,
+      reason TEXT,
+      status TEXT DEFAULT 'pending',
+      admin_notes TEXT,
+      created_at TIMESTAMP DEFAULT NOW(),
+      reviewed_at TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS payroll_records (
+      id SERIAL PRIMARY KEY,
+      employee_id INTEGER REFERENCES employees(id),
+      pay_period_start DATE,
+      pay_period_end DATE,
+      hours_total NUMERIC(10,2) DEFAULT 0,
+      gross_pay NUMERIC(10,2) DEFAULT 0,
+      deductions NUMERIC(10,2) DEFAULT 0,
+      net_pay NUMERIC(10,2) DEFAULT 0,
+      status TEXT DEFAULT 'pending',
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  console.log("Database tables initialized");
+}
+
+initDB().catch(console.error);
+
+// ========================
+// HEALTH
+// ========================
+app.get("/", (req, res) => res.json({ status: "ELS Backend Running", version: "2.0" }));
+app.get("/health", (req, res) => res.json({ status: "ok" }));
+
+// ========================
+// EMPLOYEES (Admin CRUD)
+// ========================
+app.get("/admin/employees", async (req, res) => {
   try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE, password VARCHAR(255), role VARCHAR(50), phone VARCHAR(50), sin_number VARCHAR(255), bank_account VARCHAR(255), bank_transit VARCHAR(255), bank_institution VARCHAR(255), address VARCHAR(255), city VARCHAR(255), province VARCHAR(50), postal_code VARCHAR(20), created_at TIMESTAMP DEFAULT NOW());
-      CREATE TABLE IF NOT EXISTS warehouses (id SERIAL PRIMARY KEY, name VARCHAR(255), address TEXT, base_pay_20ft DECIMAL DEFAULT 0, base_pay_40ft DECIMAL DEFAULT 0, base_pay_45ft DECIMAL DEFAULT 0, base_pay_53ft DECIMAL DEFAULT 0, piece_bonus DECIMAL DEFAULT 0, sku_bonus DECIMAL DEFAULT 0, wait_time_pay DECIMAL DEFAULT 0, piece_bonus_min INTEGER DEFAULT 0, sku_bonus_min INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT NOW());
-      CREATE TABLE IF NOT EXISTS shifts (id SERIAL PRIMARY KEY, warehouse_id INTEGER, shift_date DATE, start_time TIME, notes TEXT, created_at TIMESTAMP DEFAULT NOW());
-      CREATE TABLE IF NOT EXISTS shift_assignments (id SERIAL PRIMARY KEY, shift_id INTEGER, employee_id INTEGER, status VARCHAR(50) DEFAULT 'pending', created_at TIMESTAMP DEFAULT NOW());
-      CREATE TABLE IF NOT EXISTS containers (id SERIAL PRIMARY KEY, shift_id INTEGER, employee_id INTEGER, container_number VARCHAR(255), container_size VARCHAR(10) DEFAULT '40ft', checkin_time TIMESTAMP, checkout_time TIMESTAMP, start_time TIMESTAMP, end_time TIMESTAMP, wait_time INTEGER DEFAULT 0, total_pieces INTEGER DEFAULT 0, sku_count INTEGER DEFAULT 0, total_earning DECIMAL DEFAULT 0, total_before_split DECIMAL(10,2) DEFAULT 0, payment_status VARCHAR(50) DEFAULT 'unpaid', payroll_id INTEGER, worker_count INTEGER DEFAULT 1, co_worker_ids INTEGER[], actual_start_time VARCHAR(20), actual_end_time VARCHAR(20), hours_worked DECIMAL(5,2), status VARCHAR(50) DEFAULT 'active', created_at TIMESTAMP DEFAULT NOW());
-      CREATE TABLE IF NOT EXISTS payroll_records (id SERIAL PRIMARY KEY, employee_id INTEGER, week_start DATE, week_end DATE, total_amount DECIMAL DEFAULT 0, payment_method VARCHAR(50) DEFAULT 'direct_deposit', notes TEXT, paid_at TIMESTAMP DEFAULT NOW());
+    const r = await pool.query("SELECT * FROM employees ORDER BY name");
+    res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/admin/employees", async (req, res) => {
+  try {
+    const { name, email, phone, role, hourly_rate, status, sin_last4 } = req.body;
+    const r = await pool.query(
+      "INSERT INTO employees (name, email, phone, role, hourly_rate, status, sin_last4) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *",
+      [name, email, phone, role || "worker", hourly_rate || 20, status || "active", sin_last4]
+    );
+    res.json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put("/admin/employees/:id", async (req, res) => {
+  try {
+    const { name, email, phone, role, hourly_rate, status, sin_last4 } = req.body;
+    const r = await pool.query(
+      "UPDATE employees SET name=COALESCE($1,name), email=COALESCE($2,email), phone=COALESCE($3,phone), role=COALESCE($4,role), hourly_rate=COALESCE($5,hourly_rate), status=COALESCE($6,status), sin_last4=COALESCE($7,sin_last4) WHERE id=$8 RETURNING *",
+      [name, email, phone, role, hourly_rate, status, sin_last4, req.params.id]
+    );
+    res.json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete("/admin/employees/:id", async (req, res) => {
+  try {
+    await pool.query("DELETE FROM employees WHERE id=$1", [req.params.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ========================
+// WAREHOUSES (Admin CRUD)
+// ========================
+app.get("/admin/warehouses", async (req, res) => {
+  try {
+    const r = await pool.query("SELECT * FROM warehouses ORDER BY name");
+    res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/admin/warehouses", async (req, res) => {
+  try {
+    const { name, address, contact_name, contact_email, contact_phone, default_rate, notes } = req.body;
+    const r = await pool.query(
+      "INSERT INTO warehouses (name, address, contact_name, contact_email, contact_phone, default_rate, notes) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *",
+      [name, address, contact_name, contact_email, contact_phone, default_rate || 55, notes]
+    );
+    res.json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put("/admin/warehouses/:id", async (req, res) => {
+  try {
+    const { name, address, contact_name, contact_email, contact_phone, default_rate, notes, status } = req.body;
+    const r = await pool.query(
+      "UPDATE warehouses SET name=COALESCE($1,name), address=COALESCE($2,address), contact_name=COALESCE($3,contact_name), contact_email=COALESCE($4,contact_email), contact_phone=COALESCE($5,contact_phone), default_rate=COALESCE($6,default_rate), notes=COALESCE($7,notes), status=COALESCE($8,status) WHERE id=$9 RETURNING *",
+      [name, address, contact_name, contact_email, contact_phone, default_rate, notes, status, req.params.id]
+    );
+    res.json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ========================
+// SHIFTS (Admin CRUD + employee management)
+// ========================
+app.get("/admin/shifts", async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT s.*, w.name as warehouse_name,
+        COALESCE(json_agg(json_build_object('id', se.id, 'employee_id', se.employee_id, 'employee_name', e.name, 'hours_worked', se.hours_worked, 'status', se.status, 'check_in_time', se.check_in_time, 'check_out_time', se.check_out_time)) FILTER (WHERE se.id IS NOT NULL), '[]') as employees
+      FROM shifts s
+      LEFT JOIN warehouses w ON s.warehouse_id = w.id
+      LEFT JOIN shift_employees se ON se.shift_id = s.id
+      LEFT JOIN employees e ON se.employee_id = e.id
+      GROUP BY s.id, w.name
+      ORDER BY s.date DESC
     `);
-    console.log('DB tables ready');
-  } catch (e) { console.log('DB setup error:', e.message); }
-}
-
-async function migrateDB() {
-  try {
-    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS sin_number VARCHAR(255)');
-    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS bank_account VARCHAR(255)');
-    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS bank_transit VARCHAR(255)');
-    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS bank_institution VARCHAR(255)');
-    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS address VARCHAR(255)');
-    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS city VARCHAR(255)');
-    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS province VARCHAR(50)');
-    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS postal_code VARCHAR(20)');
-    await pool.query('ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS piece_bonus_min INTEGER DEFAULT 0');
-    await pool.query('ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS sku_bonus_min INTEGER DEFAULT 0');
-    await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS payment_status VARCHAR(50) DEFAULT \'unpaid\'');
-    await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS payroll_id INTEGER');
-    await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS worker_count INTEGER DEFAULT 1');
-    await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS co_worker_ids INTEGER[]');
-    await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS total_before_split DECIMAL(10,2)');
-    await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS actual_start_time VARCHAR(20)');
-    await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS actual_end_time VARCHAR(20)');
-    await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS hours_worked DECIMAL(5,2)');
-    console.log('DB migration complete');
-  } catch (e) { console.log('Migration error:', e.message); }
-}
-
-setupDB().then(() => migrateDB());
-
-// Health check
-app.get('/', (req, res) => { res.json({ status: 'ELS Backend running', version: '2.0.0' }); });
-
-function auth(req, res, next) {
-  const token = req.headers.authorization?.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'No token' });
-  try { req.user = jwt.verify(token, JWT_SECRET); next(); }
-  catch { res.status(401).json({ error: 'Invalid token' }); }
-}
-
-// ==================== AUTH ====================
-
-app.post('/auth/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-    if (!result.rows[0]) return res.status(401).json({ error: 'Invalid credentials' });
-    const valid = await bcrypt.compare(password, result.rows[0].password);
-    if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
-    const token = jwt.sign({ id: result.rows[0].id, role: result.rows[0].role }, JWT_SECRET);
-    const { password: _, ...user } = result.rows[0];
-    res.json({ token, user });
+    res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ==================== USERS (self) ====================
-
-app.post('/users', auth, async (req, res) => {
+app.post("/admin/shifts", async (req, res) => {
   try {
-    const { name, email, password, phone } = req.body;
-    const hash = await bcrypt.hash(password, 10);
-    const result = await pool.query('INSERT INTO users (name, email, password, role, phone) VALUES ($1,$2,$3,$4,$5) RETURNING *', [name, email, hash, 'employee', phone]);
-    const { password: _, ...user } = result.rows[0];
-    res.json(user);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/users/me', auth, async (req, res) => {
-  try {
-    const result = await pool.query('SELECT id,name,email,role,phone,sin_number,bank_account,bank_transit,bank_institution,address,city,province,postal_code FROM users WHERE id=$1', [req.user.id]);
-    if (!result.rows[0]) return res.status(404).json({ error: 'User not found' });
-    res.json(result.rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.put('/users/me', auth, async (req, res) => {
-  try {
-    const { name, email, phone } = req.body;
-    res.json((await pool.query('UPDATE users SET name=$1,email=$2,phone=$3 WHERE id=$4 RETURNING id,name,email,role,phone,sin_number,bank_account,bank_transit,bank_institution,address,city,province,postal_code', [name, email, phone, req.user.id])).rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.put('/users/me/banking', auth, async (req, res) => {
-  try {
-    const { sin_number, bank_account, bank_transit, bank_institution, address, city, province, postal_code } = req.body;
-    res.json((await pool.query('UPDATE users SET sin_number=$1,bank_account=$2,bank_transit=$3,bank_institution=$4,address=$5,city=$6,province=$7,postal_code=$8 WHERE id=$9 RETURNING id,name,email,role,phone,sin_number,bank_account,bank_transit,bank_institution,address,city,province,postal_code', [sin_number, bank_account, bank_transit, bank_institution, address, city, province, postal_code, req.user.id])).rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.put('/users/me/password', auth, async (req, res) => {
-  try {
-    const { current_password, new_password } = req.body;
-    const user = (await pool.query('SELECT password FROM users WHERE id=$1', [req.user.id])).rows[0];
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    const valid = await bcrypt.compare(current_password, user.password);
-    if (!valid) return res.status(401).json({ error: 'Current password is incorrect' });
-    const hash = await bcrypt.hash(new_password, 10);
-    await pool.query('UPDATE users SET password=$1 WHERE id=$2', [hash, req.user.id]);
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/users', auth, async (req, res) => {
-  try { res.json((await pool.query("SELECT id,name,email,role,phone FROM users WHERE role='employee'")).rows); }
-  catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.put('/users/:id', auth, async (req, res) => {
-  try {
-    const { name, email, phone } = req.body;
-    res.json((await pool.query('UPDATE users SET name=$1,email=$2,phone=$3 WHERE id=$4 RETURNING *', [name, email, phone, req.params.id])).rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.delete('/users/:id', auth, async (req, res) => {
-  try { await pool.query('DELETE FROM users WHERE id=$1', [req.params.id]); res.json({ success: true }); }
-  catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.put('/users/:id/banking', auth, async (req, res) => {
-  try {
-    const { sin_number, bank_account, bank_transit, bank_institution, address, city, province, postal_code } = req.body;
-    res.json((await pool.query('UPDATE users SET sin_number=$1,bank_account=$2,bank_transit=$3,bank_institution=$4,address=$5,city=$6,province=$7,postal_code=$8 WHERE id=$9 RETURNING *', [sin_number, bank_account, bank_transit, bank_institution, address, city, province, postal_code, req.params.id])).rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ==================== ADMIN EMPLOYEES ====================
-
-app.get('/admin/employees', auth, async (req, res) => {
-  try { res.json((await pool.query("SELECT id,name,email,role,phone,sin_number,bank_account,bank_transit,bank_institution,address,city,province,postal_code FROM users WHERE role='employee' ORDER BY name")).rows); }
-  catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/admin/employees', auth, async (req, res) => {
-  try {
-    const { name, email, password, phone } = req.body;
-    const hashed = await bcrypt.hash(password, 10);
-    res.json((await pool.query('INSERT INTO users (name,email,password,role,phone) VALUES ($1,$2,$3,$4,$5) RETURNING id,name,email,role,phone', [name, email, hashed, 'employee', phone])).rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.put('/admin/employees/:id', auth, async (req, res) => {
-  try {
-    const { name, email, phone } = req.body;
-    res.json((await pool.query('UPDATE users SET name=$1,email=$2,phone=$3 WHERE id=$4 RETURNING id,name,email,role,phone', [name, email, phone, req.params.id])).rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.put('/admin/employees/:id/banking', auth, async (req, res) => {
-  try {
-    const { sin_number, bank_account, bank_transit, bank_institution, address, city, province, postal_code } = req.body;
-    res.json((await pool.query('UPDATE users SET sin_number=$1,bank_account=$2,bank_transit=$3,bank_institution=$4,address=$5,city=$6,province=$7,postal_code=$8 WHERE id=$9 RETURNING *', [sin_number, bank_account, bank_transit, bank_institution, address, city, province, postal_code, req.params.id])).rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.delete('/admin/employees/:id', auth, async (req, res) => {
-  try {
-    await pool.query('DELETE FROM containers WHERE employee_id=$1', [req.params.id]);
-    await pool.query('DELETE FROM shift_assignments WHERE employee_id=$1', [req.params.id]);
-    await pool.query('DELETE FROM payroll_records WHERE employee_id=$1', [req.params.id]);
-    await pool.query('DELETE FROM users WHERE id=$1', [req.params.id]);
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ==================== WAREHOUSES ====================
-// FIX: Warehouse delete now handles shifts/containers referencing this warehouse
-
-app.post('/warehouses', auth, async (req, res) => {
-  try {
-    const { name, address, base_pay_20ft, base_pay_40ft, base_pay_45ft, base_pay_53ft, piece_bonus, sku_bonus, wait_time_pay, piece_bonus_min, sku_bonus_min } = req.body;
-    res.json((await pool.query('INSERT INTO warehouses (name,address,base_pay_20ft,base_pay_40ft,base_pay_45ft,base_pay_53ft,piece_bonus,sku_bonus,wait_time_pay,piece_bonus_min,sku_bonus_min) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *', [name, address, base_pay_20ft||0, base_pay_40ft||0, base_pay_45ft||0, base_pay_53ft||0, piece_bonus||0, sku_bonus||0, wait_time_pay||0, piece_bonus_min||0, sku_bonus_min||0])).rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/warehouses', auth, async (req, res) => {
-  try { res.json((await pool.query('SELECT * FROM warehouses ORDER BY created_at DESC')).rows); }
-  catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/warehouses/:id', auth, async (req, res) => {
-  try { res.json((await pool.query('SELECT * FROM warehouses WHERE id=$1', [req.params.id])).rows[0]); }
-  catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.put('/warehouses/:id', auth, async (req, res) => {
-  try {
-    const { name, address, base_pay_20ft, base_pay_40ft, base_pay_45ft, base_pay_53ft, piece_bonus, sku_bonus, wait_time_pay, piece_bonus_min, sku_bonus_min } = req.body;
-    res.json((await pool.query('UPDATE warehouses SET name=$1,address=$2,base_pay_20ft=$3,base_pay_40ft=$4,base_pay_45ft=$5,base_pay_53ft=$6,piece_bonus=$7,sku_bonus=$8,wait_time_pay=$9,piece_bonus_min=$10,sku_bonus_min=$11 WHERE id=$12 RETURNING *', [name, address, base_pay_20ft||0, base_pay_40ft||0, base_pay_45ft||0, base_pay_53ft||0, piece_bonus||0, sku_bonus||0, wait_time_pay||0, piece_bonus_min||0, sku_bonus_min||0, req.params.id])).rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// FIXED: Cascade delete warehouse - removes shifts, their containers, and assignments first
-app.delete('/warehouses/:id', auth, async (req, res) => {
-  try {
-    // Get all shifts for this warehouse
-    const shifts = await pool.query('SELECT id FROM shifts WHERE warehouse_id=$1', [req.params.id]);
-    const shiftIds = shifts.rows.map(s => s.id);
-    if (shiftIds.length > 0) {
-      // Check if any containers are completed/paid - warn if so
-      const completedCheck = await pool.query(
-        "SELECT COUNT(*) as cnt FROM containers WHERE shift_id=ANY($1) AND status='completed'",
-        [shiftIds]
-      );
-      // Delete containers that are only planned (not completed/paid)
-      await pool.query("DELETE FROM containers WHERE shift_id=ANY($1) AND status IN ('planned','active','checked_in','in_progress')", [shiftIds]);
-      // Nullify shift_id on completed containers so earnings are preserved
-      await pool.query("UPDATE containers SET shift_id=NULL WHERE shift_id=ANY($1) AND status='completed'", [shiftIds]);
-      // Delete shift assignments
-      await pool.query('DELETE FROM shift_assignments WHERE shift_id=ANY($1)', [shiftIds]);
-      // Delete shifts
-      await pool.query('DELETE FROM shifts WHERE warehouse_id=$1', [req.params.id]);
-    }
-    await pool.query('DELETE FROM warehouses WHERE id=$1', [req.params.id]);
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ==================== SHIFTS ====================
-
-app.post('/shifts', auth, async (req, res) => {
-  try {
-    const { warehouse_id, shift_date, start_time, notes, employee_ids } = req.body;
-    const shift = await pool.query('INSERT INTO shifts (warehouse_id,shift_date,start_time,notes) VALUES ($1,$2,$3,$4) RETURNING *', [warehouse_id, shift_date, start_time, notes]);
-    if (employee_ids?.length) {
+    const { warehouse_id, date, start_time, end_time, notes, employee_ids } = req.body;
+    const r = await pool.query(
+      "INSERT INTO shifts (warehouse_id, date, start_time, end_time, notes) VALUES ($1,$2,$3,$4,$5) RETURNING *",
+      [warehouse_id, date, start_time, end_time, notes]
+    );
+    const shift = r.rows[0];
+    if (employee_ids && employee_ids.length > 0) {
       for (const eid of employee_ids) {
-        await pool.query('INSERT INTO shift_assignments (shift_id,employee_id) VALUES ($1,$2)', [shift.rows[0].id, eid]);
+        await pool.query("INSERT INTO shift_employees (shift_id, employee_id) VALUES ($1,$2)", [shift.id, eid]);
       }
     }
-    res.json(shift.rows[0]);
+    res.json(shift);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/shifts', auth, async (req, res) => {
-  try { res.json((await pool.query('SELECT s.*,w.name as warehouse_name,w.address as warehouse_address FROM shifts s LEFT JOIN warehouses w ON s.warehouse_id=w.id ORDER BY s.shift_date DESC')).rows); }
-  catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/shifts/completed', auth, async (req, res) => {
+app.put("/admin/shifts/:id", async (req, res) => {
   try {
-    res.json((await pool.query("SELECT s.*,w.name as warehouse_name,w.address as warehouse_address,COUNT(c.id)::text as total_containers,COUNT(CASE WHEN c.status='completed' THEN 1 END)::text as completed_containers FROM shifts s LEFT JOIN warehouses w ON s.warehouse_id=w.id LEFT JOIN containers c ON c.shift_id=s.id GROUP BY s.id,w.name,w.address HAVING COUNT(c.id)>0 AND COUNT(c.id)=COUNT(CASE WHEN c.status='completed' THEN 1 END) ORDER BY s.shift_date DESC LIMIT 30")).rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/shifts/:id/details', auth, async (req, res) => {
-  try {
-    const shift = await pool.query('SELECT s.*,w.name as warehouse_name,w.address as warehouse_address FROM shifts s LEFT JOIN warehouses w ON s.warehouse_id=w.id WHERE s.id=$1', [req.params.id]);
-    const employees = await pool.query('SELECT u.id,u.name,u.email,u.phone,sa.status FROM shift_assignments sa JOIN users u ON sa.employee_id=u.id WHERE sa.shift_id=$1', [req.params.id]);
-    const containers = await pool.query('SELECT c.*,u.name as employee_name FROM containers c LEFT JOIN users u ON c.employee_id=u.id WHERE c.shift_id=$1 ORDER BY c.created_at ASC', [req.params.id]);
-    res.json({ shift: shift.rows[0], employees: employees.rows, containers: containers.rows });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.put('/shifts/:id', auth, async (req, res) => {
-  try {
-    const { warehouse_id, shift_date, start_time, notes } = req.body;
-    res.json((await pool.query('UPDATE shifts SET warehouse_id=$1,shift_date=$2,start_time=$3,notes=$4 WHERE id=$5 RETURNING *', [warehouse_id, shift_date, start_time, notes, req.params.id])).rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// FIXED: Delete shift - preserve completed container earnings
-app.delete('/shifts/:id', auth, async (req, res) => {
-  try {
-    // Nullify shift_id on completed containers so earnings are NOT deleted
-    await pool.query("UPDATE containers SET shift_id=NULL WHERE shift_id=$1 AND status='completed'", [req.params.id]);
-    // Delete non-completed containers
-    await pool.query("DELETE FROM containers WHERE shift_id=$1 AND status!='completed'", [req.params.id]);
-    await pool.query('DELETE FROM shift_assignments WHERE shift_id=$1', [req.params.id]);
-    await pool.query('DELETE FROM shifts WHERE id=$1', [req.params.id]);
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// FIXED: Force delete shift - same earnings preservation
-app.delete('/shifts/:id/force', auth, async (req, res) => {
-  try {
-    // Preserve completed container earnings
-    await pool.query("UPDATE containers SET shift_id=NULL WHERE shift_id=$1 AND status='completed'", [req.params.id]);
-    // Delete non-completed containers
-    await pool.query("DELETE FROM containers WHERE shift_id=$1", [req.params.id]);
-    await pool.query('DELETE FROM shift_assignments WHERE shift_id=$1', [req.params.id]);
-    await pool.query('DELETE FROM shifts WHERE id=$1', [req.params.id]);
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ==================== SHIFT ASSIGNMENTS ====================
-
-app.get('/my-shifts', auth, async (req, res) => {
-  try { res.json((await pool.query('SELECT s.*,w.name as warehouse_name,sa.status as assignment_status FROM shifts s JOIN shift_assignments sa ON s.id=sa.shift_id LEFT JOIN warehouses w ON s.warehouse_id=w.id WHERE sa.employee_id=$1 ORDER BY s.shift_date DESC', [req.user.id])).rows); }
-  catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/my-active-shifts-v2', auth, async (req, res) => {
-  try {
-    res.json((await pool.query("SELECT s.*,w.name as warehouse_name,w.address as warehouse_address,sa.status as assignment_status,COUNT(c.id)::text as total_containers,COUNT(CASE WHEN c.status='completed' THEN 1 END)::text as completed_containers,COUNT(sa2.id)::text as employee_count FROM shifts s JOIN shift_assignments sa ON sa.shift_id=s.id AND sa.employee_id=$1 JOIN warehouses w ON s.warehouse_id=w.id LEFT JOIN containers c ON c.shift_id=s.id LEFT JOIN shift_assignments sa2 ON sa2.shift_id=s.id WHERE sa.status!='rejected' GROUP BY s.id,w.name,w.address,sa.status ORDER BY s.shift_date DESC", [req.user.id])).rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// Employee's completed/past shifts
-app.get('/my-completed-shifts', auth, async (req, res) => {
-  try {
-    res.json((await pool.query("SELECT s.*,w.name as warehouse_name,w.address as warehouse_address,sa.status as assignment_status,COUNT(c.id)::text as total_containers,COUNT(CASE WHEN c.status='completed' THEN 1 END)::text as completed_containers FROM shifts s JOIN shift_assignments sa ON sa.shift_id=s.id AND sa.employee_id=$1 JOIN warehouses w ON s.warehouse_id=w.id LEFT JOIN containers c ON c.shift_id=s.id WHERE sa.status='confirmed' GROUP BY s.id,w.name,w.address,sa.status HAVING COUNT(c.id)>0 AND COUNT(c.id)=COUNT(CASE WHEN c.status='completed' THEN 1 END) ORDER BY s.shift_date DESC LIMIT 30", [req.user.id])).rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.put('/shift-assignments/:shift_id', auth, async (req, res) => {
-  try { await pool.query('UPDATE shift_assignments SET status=$1 WHERE shift_id=$2 AND employee_id=$3', [req.body.status, req.params.shift_id, req.user.id]); res.json({ success: true }); }
-  catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.put('/shift-assignments/:shift_id/respond', auth, async (req, res) => {
-  try { res.json((await pool.query('UPDATE shift_assignments SET status=$1 WHERE shift_id=$2 AND employee_id=$3 RETURNING *', [req.body.status, req.params.shift_id, req.user.id])).rows[0]); }
-  catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ==================== CONTAINERS ====================
-
-app.post('/shifts/:id/containers', auth, async (req, res) => {
-  try {
-    const inserted = [];
-    for (const c of req.body.containers) {
-      inserted.push((await pool.query('INSERT INTO containers (shift_id,container_number,container_size,status) VALUES ($1,$2,$3,$4) RETURNING *', [req.params.id, c.container_number, c.container_size, 'planned'])).rows[0]);
-    }
-    res.json(inserted);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/shifts/:id/containers', auth, async (req, res) => {
-  try { res.json((await pool.query('SELECT c.*,u.name as employee_name FROM containers c LEFT JOIN users u ON c.employee_id=u.id WHERE c.shift_id=$1 ORDER BY c.created_at ASC', [req.params.id])).rows); }
-  catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/shifts/:id/containers/v2', auth, async (req, res) => {
-  try {
-    res.json((await pool.query("SELECT c.*,u.name as employee_name FROM containers c LEFT JOIN users u ON c.employee_id=u.id WHERE c.shift_id=$1 AND (c.status='planned' OR c.employee_id=$2 OR (c.co_worker_ids IS NOT NULL AND $2=ANY(c.co_worker_ids)) OR (c.status!='completed' AND c.employee_id IS NOT NULL)) ORDER BY c.created_at ASC", [req.params.id, req.user.id])).rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.delete('/shifts/:id/containers', auth, async (req, res) => {
-  try { await pool.query("DELETE FROM containers WHERE shift_id=$1 AND status='planned'", [req.params.id]); res.json({ success: true }); }
-  catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/admin/containers', auth, async (req, res) => {
-  try { res.json((await pool.query('SELECT c.*,u.name as employee_name FROM containers c LEFT JOIN users u ON c.employee_id=u.id ORDER BY c.created_at DESC')).rows); }
-  catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/containers/checkin', auth, async (req, res) => {
-  try {
-    const { shift_id, container_number, container_size } = req.body;
-    res.json((await pool.query("INSERT INTO containers (shift_id,employee_id,container_number,container_size,checkin_time,status) VALUES ($1,$2,$3,$4,NOW(),'checked_in') RETURNING *", [shift_id, req.user.id, container_number, container_size||'40ft'])).rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/containers/checkin/v2', auth, async (req, res) => {
-  try {
-    const { shift_id, container_number, container_size } = req.body;
-    const existing = await pool.query("SELECT * FROM containers WHERE shift_id=$1 AND container_size=$2 AND status='planned' AND employee_id IS NULL LIMIT 1", [shift_id, container_size]);
-    if (existing.rows.length===0) return res.status(400).json({ error: 'No available container of this size' });
-    res.json((await pool.query("UPDATE containers SET employee_id=$1,container_number=$2,status='checked_in',checkin_time=NOW() WHERE id=$3 RETURNING *", [req.user.id, container_number, existing.rows[0].id])).rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.put('/containers/:id/start', auth, async (req, res) => {
-  try { res.json((await pool.query("UPDATE containers SET start_time=NOW(),wait_time=$1,status='in_progress' WHERE id=$2 RETURNING *", [req.body.wait_time||0, req.params.id])).rows[0]); }
-  catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/containers/:id/join', auth, async (req, res) => {
-  try {
-    const c = (await pool.query('SELECT * FROM containers WHERE id=$1', [req.params.id])).rows[0];
-    if (!c) return res.status(404).json({ error: 'Container not found' });
-    if (c.status==='completed') return res.status(400).json({ error: 'Already completed' });
-    const coWorkers = c.co_worker_ids||[];
-    if (coWorkers.includes(req.user.id)) return res.status(400).json({ error: 'Already joined' });
-    coWorkers.push(req.user.id);
-    res.json((await pool.query('UPDATE containers SET worker_count=$1,co_worker_ids=$2 WHERE id=$3 RETURNING *', [(c.worker_count||1)+1, coWorkers, req.params.id])).rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/containers/:id/workers', auth, async (req, res) => {
-  try {
-    const c = (await pool.query('SELECT * FROM containers WHERE id=$1', [req.params.id])).rows[0];
-    if (!c) return res.status(404).json({ error: 'Not found' });
-    const ids = [c.employee_id, ...(c.co_worker_ids||[])].filter(Boolean);
-    res.json((await pool.query('SELECT id,name FROM users WHERE id=ANY($1)', [ids])).rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.put('/containers/:id/checkout', auth, async (req, res) => {
-  try {
-    const { total_pieces, sku_count } = req.body;
-    const c = (await pool.query('SELECT c.*,w.piece_bonus,w.sku_bonus,w.base_pay_20ft,w.base_pay_40ft,w.base_pay_45ft,w.base_pay_53ft,w.wait_time_pay FROM containers c JOIN shifts s ON c.shift_id=s.id JOIN warehouses w ON s.warehouse_id=w.id WHERE c.id=$1', [req.params.id])).rows[0];
-    if (!c) return res.status(404).json({ error: 'Container not found' });
-    const sizeMap = {'20ft':c.base_pay_20ft,'40ft':c.base_pay_40ft,'45ft':c.base_pay_45ft,'53ft':c.base_pay_53ft};
-    const total = (parseFloat(sizeMap[c.container_size]||c.base_pay_40ft||0)) + (parseFloat(c.piece_bonus||0)*parseInt(total_pieces||0)) + (parseFloat(c.sku_bonus||0)*parseInt(sku_count||0)) + (parseFloat(c.wait_time_pay||0)*parseInt(c.wait_time||0));
-    res.json((await pool.query("UPDATE containers SET checkout_time=NOW(),end_time=NOW(),total_pieces=$1,sku_count=$2,total_earning=$3,status='completed',payment_status='unpaid' WHERE id=$4 RETURNING *", [total_pieces, sku_count, total.toFixed(2), req.params.id])).rows[0]);
-  } catch (e) { console.log('V1 CHECKOUT ERROR:', e.message); res.status(500).json({ error: e.message }); }
-});
-
-app.put('/containers/:id/checkout/v2', auth, async (req, res) => {
-  try {
-    const { total_pieces, sku_count, actual_start_time, actual_end_time } = req.body;
-    const containerId = req.params.id;
-    const container = (await pool.query('SELECT * FROM containers WHERE id=$1', [containerId])).rows[0];
-    if (!container) return res.status(404).json({ error: 'Container not found' });
-    const shift = (await pool.query('SELECT s.*,w.base_pay_20ft,w.base_pay_40ft,w.base_pay_45ft,w.base_pay_53ft,w.piece_bonus,w.sku_bonus,w.wait_time_pay,w.piece_bonus_min,w.sku_bonus_min FROM shifts s JOIN warehouses w ON s.warehouse_id=w.id WHERE s.id=$1', [container.shift_id])).rows[0];
-    if (!shift) return res.status(404).json({ error: 'Shift not found' });
-    const size = container.container_size;
-    let basePay = 0;
-    if (size==='20ft') basePay=parseFloat(shift.base_pay_20ft)||0;
-    else if (size==='40ft') basePay=parseFloat(shift.base_pay_40ft)||0;
-    else if (size==='45ft') basePay=parseFloat(shift.base_pay_45ft)||0;
-    else if (size==='53ft') basePay=parseFloat(shift.base_pay_53ft)||0;
-    const pieceBonusMin=parseInt(shift.piece_bonus_min)||0;
-    const skuBonusMin=parseInt(shift.sku_bonus_min)||0;
-    const pieceBonus=(parseInt(total_pieces||0)>pieceBonusMin)?(parseFloat(shift.piece_bonus)||0):0;
-    const skuBonus=(parseInt(sku_count||0)>skuBonusMin)?(parseFloat(shift.sku_bonus)||0):0;
-    const waitTimePay=(container.wait_time>0)?((parseFloat(shift.wait_time_pay)||0)*container.wait_time/60):0;
-    const totalBeforeSplit=basePay+pieceBonus+skuBonus+waitTimePay;
-    const workerCount=container.worker_count||1;
-    const totalPerWorker=totalBeforeSplit/workerCount;
-    let hoursWorked=null;
-    if (actual_start_time && actual_end_time) {
-      const s=new Date('1970-01-01T'+actual_start_time);
-      const e=new Date('1970-01-01T'+actual_end_time);
-      hoursWorked=(e-s)/(1000*60*60);
-      if (hoursWorked<0) hoursWorked+=24;
-    }
-    await pool.query('UPDATE containers SET status=$1,checkout_time=NOW(),total_pieces=$2,sku_count=$3,total_earning=$4,total_before_split=$5,payment_status=$6,actual_start_time=$7,actual_end_time=$8,hours_worked=$9 WHERE id=$10', ['completed', total_pieces||0, sku_count||0, totalPerWorker.toFixed(2), totalBeforeSplit.toFixed(2), 'unpaid', actual_start_time||null, actual_end_time||null, hoursWorked, containerId]);
-    if (container.co_worker_ids && container.co_worker_ids.length>0) {
-      for (const cid of container.co_worker_ids) {
-        await pool.query('UPDATE containers SET total_earning=$1,total_before_split=$2,payment_status=$3,actual_start_time=$4,actual_end_time=$5,hours_worked=$6 WHERE shift_id=$7 AND employee_id=$8 AND container_number=$9 AND id!=$10', [totalPerWorker.toFixed(2), totalBeforeSplit.toFixed(2), 'unpaid', actual_start_time||null, actual_end_time||null, hoursWorked, container.shift_id, cid, container.container_number, containerId]);
-      }
-    }
-    res.json((await pool.query('SELECT * FROM containers WHERE id=$1', [containerId])).rows[0]);
-  } catch (e) { console.log('V2 CHECKOUT ERROR:', e.message, e.stack); res.status(500).json({ error: e.message }); }
-});
-
-// ==================== EARNINGS ====================
-
-app.get('/earnings/weekly', auth, async (req, res) => {
-  try { res.json((await pool.query("SELECT COALESCE(SUM(total_earning::numeric),0) as total,COUNT(*) as containers FROM containers WHERE employee_id=$1 AND created_at>=NOW()-INTERVAL '7 days' AND status='completed'", [req.user.id])).rows[0]); }
-  catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/earnings/detail/:employee_id', auth, async (req, res) => {
-  try { res.json((await pool.query('SELECT c.*,s.shift_date,w.name as warehouse_name FROM containers c LEFT JOIN shifts s ON c.shift_id=s.id LEFT JOIN warehouses w ON s.warehouse_id=w.id WHERE c.employee_id=$1 ORDER BY c.created_at DESC', [req.params.employee_id])).rows); }
-  catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ==================== PAYROLL ====================
-
-app.get('/admin/payroll/weekly', auth, async (req, res) => {
-  try {
-    res.json((await pool.query("SELECT u.id,u.name,u.email,u.phone,u.sin_number,u.bank_account,u.bank_transit,u.bank_institution,u.address,u.city,u.province,u.postal_code,COUNT(c.id)::text as container_count,COALESCE(SUM(CASE WHEN c.total_earning IS NOT NULL THEN c.total_earning::numeric ELSE 0 END),0)::text as total_earned,COALESCE(SUM(CASE WHEN (c.payment_status IS NULL OR c.payment_status!='paid') AND c.status='completed' AND c.total_earning IS NOT NULL THEN c.total_earning::numeric ELSE 0 END),0)::text as total_unpaid FROM users u LEFT JOIN containers c ON c.employee_id=u.id AND c.created_at>=NOW()-INTERVAL '7 days' WHERE u.role='employee' GROUP BY u.id,u.name,u.email,u.phone,u.sin_number,u.bank_account,u.bank_transit,u.bank_institution,u.address,u.city,u.province,u.postal_code")).rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/payroll/weekly', auth, async (req, res) => {
-  try {
-    res.json((await pool.query("SELECT u.id,u.name,u.email,u.phone,u.sin_number,u.bank_account,u.bank_transit,u.bank_institution,u.address,u.city,u.province,u.postal_code,COUNT(c.id)::text as container_count,COALESCE(SUM(CASE WHEN c.total_earning IS NOT NULL THEN c.total_earning::numeric ELSE 0 END),0)::text as total_earned,COALESCE(SUM(CASE WHEN (c.payment_status IS NULL OR c.payment_status!='paid') AND c.status='completed' AND c.total_earning IS NOT NULL THEN c.total_earning::numeric ELSE 0 END),0)::text as total_unpaid FROM users u LEFT JOIN containers c ON c.employee_id=u.id AND c.created_at>=NOW()-INTERVAL '7 days' WHERE u.role='employee' GROUP BY u.id,u.name,u.email,u.phone,u.sin_number,u.bank_account,u.bank_transit,u.bank_institution,u.address,u.city,u.province,u.postal_code")).rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/admin/payroll/mark-paid', auth, async (req, res) => {
-  try {
-    const { employee_id, week_start, week_end, total_amount, payment_method, notes } = req.body;
-    const r = await pool.query('INSERT INTO payroll_records (employee_id,week_start,week_end,total_amount,payment_method,notes,paid_at) VALUES ($1,$2,$3,$4,$5,$6,NOW()) RETURNING *', [employee_id, week_start, week_end, total_amount, payment_method||'direct_deposit', notes||'']);
-    await pool.query("UPDATE containers SET payment_status='paid',payroll_id=$1 WHERE employee_id=$2 AND created_at>=$3::date AND created_at<($4::date+interval '1 day') AND status='completed' AND (payment_status IS NULL OR payment_status!='paid')", [r.rows[0].id, employee_id, week_start, week_end]);
+    const { warehouse_id, date, start_time, end_time, status, notes } = req.body;
+    const r = await pool.query(
+      "UPDATE shifts SET warehouse_id=COALESCE($1,warehouse_id), date=COALESCE($2,date), start_time=COALESCE($3,start_time), end_time=COALESCE($4,end_time), status=COALESCE($5,status), notes=COALESCE($6,notes) WHERE id=$7 RETURNING *",
+      [warehouse_id, date, start_time, end_time, status, notes, req.params.id]
+    );
     res.json(r.rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/payroll/mark-paid', auth, async (req, res) => {
+// ---- Shift Employee Management (ADD/REMOVE/UPDATE) ----
+app.post("/admin/shifts/:id/employees", async (req, res) => {
   try {
-    const { employee_id, week_start, week_end, total_amount, payment_method, notes } = req.body;
-    const r = await pool.query('INSERT INTO payroll_records (employee_id,week_start,week_end,total_amount,payment_method,notes,paid_at) VALUES ($1,$2,$3,$4,$5,$6,NOW()) RETURNING *', [employee_id, week_start, week_end, total_amount, payment_method||'direct_deposit', notes||'']);
-    await pool.query("UPDATE containers SET payment_status='paid',payroll_id=$1 WHERE employee_id=$2 AND created_at>=$3::date AND created_at<($4::date+interval '1 day') AND status='completed' AND (payment_status IS NULL OR payment_status!='paid')", [r.rows[0].id, employee_id, week_start, week_end]);
+    const { employee_id } = req.body;
+    const r = await pool.query(
+      "INSERT INTO shift_employees (shift_id, employee_id) VALUES ($1,$2) RETURNING *",
+      [req.params.id, employee_id]
+    );
     res.json(r.rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/admin/payroll/history/:employee_id', auth, async (req, res) => {
-  try { res.json((await pool.query('SELECT * FROM payroll_records WHERE employee_id=$1 ORDER BY paid_at DESC', [req.params.employee_id])).rows); }
-  catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/payroll/history/:employee_id', auth, async (req, res) => {
-  try { res.json((await pool.query('SELECT * FROM payroll_records WHERE employee_id=$1 ORDER BY paid_at DESC', [req.params.employee_id])).rows); }
-  catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ==================== DASHBOARD ====================
-
-app.get('/admin/dashboard', auth, async (req, res) => {
+app.delete("/admin/shifts/:shiftId/employees/:empId", async (req, res) => {
   try {
-    const ac = await pool.query("SELECT c.*,u.name as employee_name,w.name as warehouse_name FROM containers c LEFT JOIN users u ON c.employee_id=u.id LEFT JOIN shifts s ON c.shift_id=s.id LEFT JOIN warehouses w ON s.warehouse_id=w.id WHERE c.status IN ('checked_in','in_progress') ORDER BY c.checkin_time DESC");
-    const ws = await pool.query("SELECT COUNT(DISTINCT c.employee_id)::text as employees_worked,COUNT(c.id)::text as containers_completed,COALESCE(SUM(CASE WHEN c.status='completed' THEN c.total_earning::numeric ELSE 0 END),0)::text as total_earned,COALESCE(SUM(CASE WHEN c.status='completed' AND (c.payment_status IS NULL OR c.payment_status!='paid') THEN c.total_earning::numeric ELSE 0 END),0)::text as total_unpaid FROM containers c WHERE c.created_at>=NOW()-INTERVAL '7 days'");
-    const ts = await pool.query("SELECT s.*,w.name as warehouse_name,w.address as warehouse_address,COUNT(sa.id)::text as employee_count FROM shifts s LEFT JOIN warehouses w ON s.warehouse_id=w.id LEFT JOIN shift_assignments sa ON sa.shift_id=s.id WHERE DATE(s.shift_date)=CURRENT_DATE GROUP BY s.id,w.name,w.address ORDER BY s.start_time ASC");
-    const te = await pool.query("SELECT u.name,u.id,COALESCE(SUM(c.total_earning::numeric),0)::text as total_earned,COUNT(c.id)::text as containers_done FROM users u LEFT JOIN containers c ON c.employee_id=u.id AND c.created_at>=NOW()-INTERVAL '7 days' AND c.status='completed' WHERE u.role='employee' GROUP BY u.id,u.name ORDER BY total_earned DESC LIMIT 5");
-    res.json({ active_containers: ac.rows, weekly_stats: ws.rows[0], today_shifts: ts.rows, top_earners: te.rows });
+    await pool.query("DELETE FROM shift_employees WHERE shift_id=$1 AND employee_id=$2", [req.params.shiftId, req.params.empId]);
+    res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ==================== MIGRATION UTILITY ====================
-
-app.get('/admin/migrate-columns', async (req, res) => {
+app.put("/admin/shift-employees/:id", async (req, res) => {
   try {
-    await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS total_before_split DECIMAL(10,2)');
-    await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS actual_start_time VARCHAR(20)');
-    await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS actual_end_time VARCHAR(20)');
-    await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS hours_worked DECIMAL(5,2)');
-    await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS payment_status VARCHAR(50)');
-    await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS worker_count INTEGER DEFAULT 1');
-    await pool.query('ALTER TABLE containers ADD COLUMN IF NOT EXISTS co_worker_ids INTEGER[]');
-    await pool.query('ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS piece_bonus_min INTEGER DEFAULT 0');
-    await pool.query('ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS sku_bonus_min INTEGER DEFAULT 0');
-    res.json({ success: true, message: 'Columns added!' });
+    const { hours_worked, status, check_in_time, check_out_time } = req.body;
+    const r = await pool.query(
+      "UPDATE shift_employees SET hours_worked=COALESCE($1,hours_worked), status=COALESCE($2,status), check_in_time=COALESCE($3,check_in_time), check_out_time=COALESCE($4,check_out_time) WHERE id=$5 RETURNING *",
+      [hours_worked, status, check_in_time, check_out_time, req.params.id]
+    );
+    res.json(r.rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ==================== WORKER DETAIL REPORTS ====================
-
-// Detailed worker report - full stats for a specific employee
-app.get('/admin/worker-report/:employee_id', auth, async (req, res) => {
+// ========================
+// CONTAINERS
+// ========================
+app.get("/admin/containers", async (req, res) => {
   try {
-    const eid = req.params.employee_id;
-    
-    // Employee info
-    const emp = (await pool.query('SELECT id,name,email,phone,sin_number,bank_account,bank_transit,bank_institution,address,city,province,postal_code,created_at FROM users WHERE id=$1', [eid])).rows[0];
-    if (!emp) return res.status(404).json({ error: 'Employee not found' });
-
-    // All-time stats
-    const allTime = (await pool.query(`
-      SELECT 
-        COUNT(*)::text as total_containers,
-        COALESCE(SUM(total_earning::numeric),0)::text as total_earned,
-        COALESCE(SUM(CASE WHEN payment_status='paid' THEN total_earning::numeric ELSE 0 END),0)::text as total_paid,
-        COALESCE(SUM(CASE WHEN payment_status IS NULL OR payment_status!='paid' THEN total_earning::numeric ELSE 0 END),0)::text as total_unpaid,
-        COALESCE(SUM(total_pieces),0)::text as total_pieces,
-        COALESCE(SUM(sku_count),0)::text as total_skus,
-        COALESCE(SUM(hours_worked),0)::text as total_hours,
-        COALESCE(AVG(CASE WHEN hours_worked > 0 THEN total_earning::numeric / hours_worked END),0)::text as avg_hourly_rate,
-        COALESCE(AVG(total_earning::numeric),0)::text as avg_per_container,
-        MIN(created_at)::text as first_container_date,
-        MAX(created_at)::text as last_container_date
-      FROM containers WHERE employee_id=$1 AND status='completed'
-    `, [eid])).rows[0];
-
-    // This week stats
-    const thisWeek = (await pool.query(`
-      SELECT 
-        COUNT(*)::text as containers,
-        COALESCE(SUM(total_earning::numeric),0)::text as earned,
-        COALESCE(SUM(hours_worked),0)::text as hours,
-        COALESCE(SUM(total_pieces),0)::text as pieces
-      FROM containers WHERE employee_id=$1 AND status='completed' AND created_at>=NOW()-INTERVAL '7 days'
-    `, [eid])).rows[0];
-
-    // This month stats
-    const thisMonth = (await pool.query(`
-      SELECT 
-        COUNT(*)::text as containers,
-        COALESCE(SUM(total_earning::numeric),0)::text as earned,
-        COALESCE(SUM(hours_worked),0)::text as hours,
-        COALESCE(SUM(total_pieces),0)::text as pieces
-      FROM containers WHERE employee_id=$1 AND status='completed' AND created_at>=date_trunc('month', NOW())
-    `, [eid])).rows[0];
-
-    // Container size breakdown
-    const sizeBreakdown = (await pool.query(`
-      SELECT container_size, COUNT(*)::text as count, COALESCE(SUM(total_earning::numeric),0)::text as earned
-      FROM containers WHERE employee_id=$1 AND status='completed'
-      GROUP BY container_size ORDER BY count DESC
-    `, [eid])).rows;
-
-    // Weekly earnings history (last 12 weeks)
-    const weeklyHistory = (await pool.query(`
-      SELECT 
-        date_trunc('week', created_at)::date::text as week_start,
-        COUNT(*)::text as containers,
-        COALESCE(SUM(total_earning::numeric),0)::text as earned,
-        COALESCE(SUM(hours_worked),0)::text as hours
-      FROM containers WHERE employee_id=$1 AND status='completed' AND created_at>=NOW()-INTERVAL '12 weeks'
-      GROUP BY date_trunc('week', created_at) ORDER BY week_start DESC
-    `, [eid])).rows;
-
-    // Recent containers (last 20)
-    const recentContainers = (await pool.query(`
-      SELECT c.*, s.shift_date, w.name as warehouse_name
-      FROM containers c 
-      LEFT JOIN shifts s ON c.shift_id=s.id 
-      LEFT JOIN warehouses w ON s.warehouse_id=w.id
-      WHERE c.employee_id=$1 AND c.status='completed'
-      ORDER BY c.created_at DESC LIMIT 20
-    `, [eid])).rows;
-
-    // Payroll records
-    const payrollHistory = (await pool.query('SELECT * FROM payroll_records WHERE employee_id=$1 ORDER BY paid_at DESC LIMIT 10', [eid])).rows;
-
-    res.json({
-      employee: emp,
-      all_time: allTime,
-      this_week: thisWeek,
-      this_month: thisMonth,
-      size_breakdown: sizeBreakdown,
-      weekly_history: weeklyHistory,
-      recent_containers: recentContainers,
-      payroll_history: payrollHistory
-    });
+    const r = await pool.query(`
+      SELECT c.*, w.name as warehouse_name, s.date as shift_date
+      FROM containers c
+      LEFT JOIN warehouses w ON c.warehouse_id = w.id
+      LEFT JOIN shifts s ON c.shift_id = s.id
+      ORDER BY c.assigned_at DESC
+    `);
+    res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Pay period summary with estimated deductions for all employees
-app.get('/admin/payroll/period-summary', auth, async (req, res) => {
+app.post("/admin/containers", async (req, res) => {
   try {
-    const { start_date, end_date } = req.query;
-    const startDate = start_date || new Date(Date.now() - 7*24*60*60*1000).toISOString().split('T')[0];
-    const endDate = end_date || new Date().toISOString().split('T')[0];
+    const { container_number, shift_id, warehouse_id, type, notes } = req.body;
+    const r = await pool.query(
+      "INSERT INTO containers (container_number, shift_id, warehouse_id, type, notes) VALUES ($1,$2,$3,$4,$5) RETURNING *",
+      [container_number, shift_id, warehouse_id, type, notes]
+    );
+    res.json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
-    const employees = (await pool.query(`
-      SELECT 
-        u.id, u.name, u.email, u.phone, u.sin_number,
-        u.bank_account, u.bank_transit, u.bank_institution,
-        u.address, u.city, u.province, u.postal_code,
-        COUNT(c.id)::text as container_count,
-        COALESCE(SUM(c.hours_worked),0)::text as total_hours,
-        COALESCE(SUM(c.total_pieces),0)::text as total_pieces,
-        COALESCE(SUM(c.sku_count),0)::text as total_skus,
-        COALESCE(SUM(c.total_earning::numeric),0)::text as gross_pay,
-        COALESCE(SUM(CASE WHEN c.payment_status='paid' THEN c.total_earning::numeric ELSE 0 END),0)::text as already_paid,
-        COALESCE(SUM(CASE WHEN c.payment_status IS NULL OR c.payment_status!='paid' THEN c.total_earning::numeric ELSE 0 END),0)::text as unpaid
-      FROM users u
-      LEFT JOIN containers c ON c.employee_id=u.id 
-        AND c.status='completed' 
-        AND c.created_at >= $1::date 
-        AND c.created_at < ($2::date + interval '1 day')
-      WHERE u.role='employee'
-      GROUP BY u.id, u.name, u.email, u.phone, u.sin_number,
-        u.bank_account, u.bank_transit, u.bank_institution,
-        u.address, u.city, u.province, u.postal_code
-      ORDER BY u.name
-    `, [startDate, endDate])).rows;
+app.put("/admin/containers/:id", async (req, res) => {
+  try {
+    const { container_number, shift_id, warehouse_id, status, type, notes } = req.body;
+    const fields = [];
+    const vals = [];
+    let idx = 1;
+    if (container_number !== undefined) { fields.push(`container_number=$${idx++}`); vals.push(container_number); }
+    if (shift_id !== undefined) { fields.push(`shift_id=$${idx++}`); vals.push(shift_id); }
+    if (warehouse_id !== undefined) { fields.push(`warehouse_id=$${idx++}`); vals.push(warehouse_id); }
+    if (status !== undefined) { fields.push(`status=$${idx++}`); vals.push(status); }
+    if (type !== undefined) { fields.push(`type=$${idx++}`); vals.push(type); }
+    if (notes !== undefined) { fields.push(`notes=$${idx++}`); vals.push(notes); }
+    if (status === "completed") { fields.push(`completed_at=NOW()`); }
+    vals.push(req.params.id);
+    const r = await pool.query(`UPDATE containers SET ${fields.join(",")} WHERE id=$${idx} RETURNING *`, vals);
+    res.json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
-    // Add estimated deductions (2026 BC rates)
-    const CPP_RATE = 0.0595;
-    const CPP_BASIC_EXEMPTION_ANNUAL = 3500;
-    const EI_EMPLOYEE_RATE = 0.0163;
-    const EI_EMPLOYER_RATE = 0.02282; // 1.4x employee rate
+// Container reassignment
+app.put("/admin/containers/:id/reassign", async (req, res) => {
+  try {
+    const { shift_id, warehouse_id } = req.body;
+    const r = await pool.query(
+      "UPDATE containers SET shift_id=COALESCE($1,shift_id), warehouse_id=COALESCE($2,warehouse_id), assigned_at=NOW() WHERE id=$3 RETURNING *",
+      [shift_id, warehouse_id, req.params.id]
+    );
+    res.json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
-    const withDeductions = employees.map(emp => {
-      const grossPay = parseFloat(emp.gross_pay) || 0;
-      // Estimate CPP (simplified - per pay period)
-      const cppEmployee = Math.max(0, grossPay * CPP_RATE);
-      const cppEmployer = cppEmployee;
-      // Estimate EI
-      const eiEmployee = grossPay * EI_EMPLOYEE_RATE;
-      const eiEmployer = grossPay * EI_EMPLOYER_RATE;
-      // Rough federal+BC tax estimate (simplified for low income bracket)
-      const annualizedGross = grossPay * 52; // rough annualization
-      let estTaxRate = 0;
-      if (annualizedGross > 16129) { // above federal BPA
-        estTaxRate = 0.14 + 0.0506; // federal 14% + BC 5.06% lowest brackets
+// ========================
+// INVOICES
+// ========================
+app.get("/admin/invoices", async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT i.*, w.name as warehouse_name,
+        COALESCE(json_agg(json_build_object('id', il.id, 'description', il.description, 'quantity', il.quantity, 'unit_price', il.unit_price, 'line_total', il.line_total)) FILTER (WHERE il.id IS NOT NULL), '[]') as lines
+      FROM invoices i
+      LEFT JOIN warehouses w ON i.warehouse_id = w.id
+      LEFT JOIN invoice_lines il ON il.invoice_id = i.id
+      GROUP BY i.id, w.name
+      ORDER BY i.date_issued DESC
+    `);
+    res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/admin/invoices", async (req, res) => {
+  try {
+    const { warehouse_id, due_date, notes, tax_rate, lines } = req.body;
+    // Generate invoice number: ELS-YYYYMMDD-XXXX
+    const countR = await pool.query("SELECT COUNT(*) as c FROM invoices");
+    const num = String(parseInt(countR.rows[0].c) + 1).padStart(4, "0");
+    const today = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+    const invoice_number = `ELS-${today}-${num}`;
+    const tr = parseFloat(tax_rate) || 0.05;
+
+    const r = await pool.query(
+      "INSERT INTO invoices (warehouse_id, invoice_number, due_date, notes, tax_rate) VALUES ($1,$2,$3,$4,$5) RETURNING *",
+      [warehouse_id, invoice_number, due_date, notes, tr]
+    );
+    const inv = r.rows[0];
+
+    let subtotal = 0;
+    if (lines && lines.length > 0) {
+      for (const ln of lines) {
+        const lt = (parseFloat(ln.quantity) || 1) * (parseFloat(ln.unit_price) || 0);
+        subtotal += lt;
+        await pool.query(
+          "INSERT INTO invoice_lines (invoice_id, description, quantity, unit_price, line_total) VALUES ($1,$2,$3,$4,$5)",
+          [inv.id, ln.description, ln.quantity || 1, ln.unit_price || 0, lt]
+        );
       }
-      const incomeTax = Math.max(0, grossPay * estTaxRate);
-      const totalDeductions = cppEmployee + eiEmployee + incomeTax;
-      const netPay = grossPay - totalDeductions;
-      const employerCost = grossPay + cppEmployer + eiEmployer;
-
-      return {
-        ...emp,
-        estimated_cpp_employee: cppEmployee.toFixed(2),
-        estimated_cpp_employer: cppEmployer.toFixed(2),
-        estimated_ei_employee: eiEmployee.toFixed(2),
-        estimated_ei_employer: eiEmployer.toFixed(2),
-        estimated_income_tax: incomeTax.toFixed(2),
-        estimated_total_deductions: totalDeductions.toFixed(2),
-        estimated_net_pay: netPay.toFixed(2),
-        estimated_total_employer_cost: employerCost.toFixed(2)
-      };
-    });
-
-    // Totals
-    const totals = withDeductions.reduce((acc, emp) => {
-      acc.gross += parseFloat(emp.gross_pay) || 0;
-      acc.cpp_employee += parseFloat(emp.estimated_cpp_employee) || 0;
-      acc.cpp_employer += parseFloat(emp.estimated_cpp_employer) || 0;
-      acc.ei_employee += parseFloat(emp.estimated_ei_employee) || 0;
-      acc.ei_employer += parseFloat(emp.estimated_ei_employer) || 0;
-      acc.income_tax += parseFloat(emp.estimated_income_tax) || 0;
-      acc.net_pay += parseFloat(emp.estimated_net_pay) || 0;
-      acc.employer_cost += parseFloat(emp.estimated_total_employer_cost) || 0;
-      acc.hours += parseFloat(emp.total_hours) || 0;
-      acc.containers += parseInt(emp.container_count) || 0;
-      return acc;
-    }, { gross: 0, cpp_employee: 0, cpp_employer: 0, ei_employee: 0, ei_employer: 0, income_tax: 0, net_pay: 0, employer_cost: 0, hours: 0, containers: 0 });
-
-    res.json({
-      period: { start: startDate, end: endDate },
-      employees: withDeductions,
-      totals: {
-        gross_pay: totals.gross.toFixed(2),
-        cpp_employee: totals.cpp_employee.toFixed(2),
-        cpp_employer: totals.cpp_employer.toFixed(2),
-        ei_employee: totals.ei_employee.toFixed(2),
-        ei_employer: totals.ei_employer.toFixed(2),
-        income_tax: totals.income_tax.toFixed(2),
-        net_pay: totals.net_pay.toFixed(2),
-        total_employer_cost: totals.employer_cost.toFixed(2),
-        total_hours: totals.hours.toFixed(1),
-        total_containers: totals.containers
-      },
-      note: 'Deduction estimates use 2026 BC rates. Use CRA PDOC calculator or payroll service for exact amounts.'
-    });
+    }
+    const tax_amount = subtotal * tr;
+    const total = subtotal + tax_amount;
+    const updated = await pool.query(
+      "UPDATE invoices SET subtotal=$1, tax_amount=$2, total=$3 WHERE id=$4 RETURNING *",
+      [subtotal, tax_amount, total, inv.id]
+    );
+    res.json(updated.rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// CSV export of payroll data for import into payroll service
-app.get('/admin/payroll/export-csv', auth, async (req, res) => {
+app.put("/admin/invoices/:id", async (req, res) => {
   try {
-    const { start_date, end_date } = req.query;
-    const startDate = start_date || new Date(Date.now() - 7*24*60*60*1000).toISOString().split('T')[0];
-    const endDate = end_date || new Date().toISOString().split('T')[0];
-
-    const data = (await pool.query(`
-      SELECT 
-        u.name as employee_name,
-        u.email,
-        u.phone,
-        u.sin_number,
-        u.bank_institution,
-        u.bank_transit,
-        u.bank_account,
-        u.address,
-        u.city,
-        u.province,
-        u.postal_code,
-        COUNT(c.id) as containers_worked,
-        COALESCE(SUM(c.hours_worked),0) as total_hours,
-        COALESCE(SUM(c.total_pieces),0) as total_pieces,
-        COALESCE(SUM(c.sku_count),0) as total_skus,
-        COALESCE(SUM(c.total_earning::numeric),0) as gross_earnings
-      FROM users u
-      LEFT JOIN containers c ON c.employee_id=u.id 
-        AND c.status='completed' 
-        AND c.created_at >= $1::date 
-        AND c.created_at < ($2::date + interval '1 day')
-      WHERE u.role='employee'
-      GROUP BY u.id, u.name, u.email, u.phone, u.sin_number,
-        u.bank_institution, u.bank_transit, u.bank_account,
-        u.address, u.city, u.province, u.postal_code
-      HAVING COALESCE(SUM(c.total_earning::numeric),0) > 0
-      ORDER BY u.name
-    `, [startDate, endDate])).rows;
-
-    // Build CSV
-    const headers = 'Employee Name,Email,Phone,SIN,Bank Institution,Bank Transit,Bank Account,Address,City,Province,Postal Code,Containers Worked,Total Hours,Total Pieces,Total SKUs,Gross Earnings\n';
-    const rows = data.map(r => 
-      `"${r.employee_name}","${r.email}","${r.phone || ''}","${r.sin_number || ''}","${r.bank_institution || ''}","${r.bank_transit || ''}","${r.bank_account || ''}","${r.address || ''}","${r.city || ''}","${r.province || ''}","${r.postal_code || ''}",${r.containers_worked},${r.total_hours},${r.total_pieces},${r.total_skus},${r.gross_earnings}`
-    ).join('\n');
-
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', `attachment; filename=els-payroll-${startDate}-to-${endDate}.csv`);
-    res.send(headers + rows);
+    const { status, notes, due_date } = req.body;
+    const r = await pool.query(
+      "UPDATE invoices SET status=COALESCE($1,status), notes=COALESCE($2,notes), due_date=COALESCE($3,due_date) WHERE id=$4 RETURNING *",
+      [status, notes, due_date, req.params.id]
+    );
+    res.json(r.rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// T4 year-end summary per employee
-app.get('/admin/t4-summary/:year', auth, async (req, res) => {
+// ========================
+// TIME-OFF REQUESTS
+// ========================
+app.get("/admin/time-off", async (req, res) => {
   try {
-    const year = req.params.year;
-    const data = (await pool.query(`
-      SELECT 
-        u.id, u.name, u.email, u.sin_number,
-        u.address, u.city, u.province, u.postal_code,
-        COUNT(c.id)::text as total_containers,
-        COALESCE(SUM(c.hours_worked),0)::text as total_hours,
-        COALESCE(SUM(c.total_earning::numeric),0)::text as total_employment_income,
-        COALESCE(SUM(CASE WHEN c.payment_status='paid' THEN c.total_earning::numeric ELSE 0 END),0)::text as total_paid,
-        COALESCE(SUM(CASE WHEN c.payment_status IS NULL OR c.payment_status!='paid' THEN c.total_earning::numeric ELSE 0 END),0)::text as total_unpaid
-      FROM users u
-      LEFT JOIN containers c ON c.employee_id=u.id 
-        AND c.status='completed'
-        AND EXTRACT(YEAR FROM c.created_at) = $1
-      WHERE u.role='employee'
-      GROUP BY u.id, u.name, u.email, u.sin_number, u.address, u.city, u.province, u.postal_code
-      HAVING COALESCE(SUM(c.total_earning::numeric),0) > 0
-      ORDER BY u.name
-    `, [year])).rows;
+    const r = await pool.query(`
+      SELECT t.*, e.name as employee_name
+      FROM time_off_requests t
+      LEFT JOIN employees e ON t.employee_id = e.id
+      ORDER BY t.created_at DESC
+    `);
+    res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
-    const grandTotal = data.reduce((sum, d) => sum + (parseFloat(d.total_employment_income) || 0), 0);
+app.put("/admin/time-off/:id", async (req, res) => {
+  try {
+    const { status, admin_notes } = req.body;
+    const r = await pool.query(
+      "UPDATE time_off_requests SET status=COALESCE($1,status), admin_notes=COALESCE($2,admin_notes), reviewed_at=NOW() WHERE id=$3 RETURNING *",
+      [status, admin_notes, req.params.id]
+    );
+    res.json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
+// Employee submits time-off
+app.post("/employee/time-off", async (req, res) => {
+  try {
+    const { employee_id, start_date, end_date, reason } = req.body;
+    const r = await pool.query(
+      "INSERT INTO time_off_requests (employee_id, start_date, end_date, reason) VALUES ($1,$2,$3,$4) RETURNING *",
+      [employee_id, start_date, end_date, reason]
+    );
+    res.json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Employee views own time-off
+app.get("/employee/:id/time-off", async (req, res) => {
+  try {
+    const r = await pool.query("SELECT * FROM time_off_requests WHERE employee_id=$1 ORDER BY created_at DESC", [req.params.id]);
+    res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ========================
+// T4 YEAR-END SUMMARY
+// ========================
+app.get("/admin/t4-summary", async (req, res) => {
+  try {
+    const year = req.query.year || new Date().getFullYear();
+    const r = await pool.query(`
+      SELECT e.id, e.name, e.sin_last4,
+        COALESCE(SUM(se.hours_worked), 0) as total_hours,
+        COALESCE(SUM(se.hours_worked * e.hourly_rate), 0) as gross_earnings
+      FROM employees e
+      LEFT JOIN shift_employees se ON se.employee_id = e.id
+      LEFT JOIN shifts s ON se.shift_id = s.id AND EXTRACT(YEAR FROM s.date) = $1
+      WHERE e.status = 'active'
+      GROUP BY e.id, e.name, e.sin_last4
+      ORDER BY e.name
+    `, [year]);
+    res.json({ year: parseInt(year), employees: r.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ========================
+// CSV EXPORT
+// ========================
+app.get("/admin/export/:type", async (req, res) => {
+  try {
+    const { type } = req.params;
+    let query, filename;
+    switch (type) {
+      case "employees":
+        query = "SELECT id, name, email, phone, role, hourly_rate, status, created_at FROM employees ORDER BY name";
+        filename = "els_employees.csv";
+        break;
+      case "shifts":
+        query = `SELECT s.id, s.date, s.start_time, s.end_time, s.status, w.name as warehouse FROM shifts s LEFT JOIN warehouses w ON s.warehouse_id=w.id ORDER BY s.date DESC`;
+        filename = "els_shifts.csv";
+        break;
+      case "invoices":
+        query = `SELECT i.id, i.invoice_number, i.date_issued, i.due_date, i.subtotal, i.tax_amount, i.total, i.status, w.name as warehouse FROM invoices i LEFT JOIN warehouses w ON i.warehouse_id=w.id ORDER BY i.date_issued DESC`;
+        filename = "els_invoices.csv";
+        break;
+      case "containers":
+        query = `SELECT c.id, c.container_number, c.status, c.type, w.name as warehouse, s.date as shift_date FROM containers c LEFT JOIN warehouses w ON c.warehouse_id=w.id LEFT JOIN shifts s ON c.shift_id=s.id ORDER BY c.assigned_at DESC`;
+        filename = "els_containers.csv";
+        break;
+      case "payroll":
+        query = `SELECT e.name, SUM(se.hours_worked) as total_hours, e.hourly_rate, SUM(se.hours_worked * e.hourly_rate) as gross_pay FROM shift_employees se JOIN employees e ON se.employee_id=e.id JOIN shifts s ON se.shift_id=s.id GROUP BY e.id, e.name, e.hourly_rate ORDER BY e.name`;
+        filename = "els_payroll.csv";
+        break;
+      default:
+        return res.status(400).json({ error: "Invalid export type" });
+    }
+    const r = await pool.query(query);
+    if (r.rows.length === 0) return res.json({ csv: "", filename });
+    const headers = Object.keys(r.rows[0]);
+    const csvRows = [headers.join(",")];
+    for (const row of r.rows) {
+      csvRows.push(headers.map(h => {
+        const v = row[h];
+        if (v === null || v === undefined) return "";
+        const s = String(v);
+        return s.includes(",") || s.includes('"') ? `"${s.replace(/"/g, '""')}"` : s;
+      }).join(","));
+    }
+    res.json({ csv: csvRows.join("\n"), filename });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ========================
+// EMPLOYEE-FACING ROUTES
+// ========================
+app.get("/employee/:id/profile", async (req, res) => {
+  try {
+    const r = await pool.query("SELECT id, name, email, phone, role, hourly_rate, status FROM employees WHERE id=$1", [req.params.id]);
+    if (r.rows.length === 0) return res.status(404).json({ error: "Not found" });
+    res.json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/employee/:id/shifts", async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT s.id, s.date, s.start_time, s.end_time, s.status, w.name as warehouse_name,
+        se.hours_worked, se.status as assignment_status, se.check_in_time, se.check_out_time
+      FROM shift_employees se
+      JOIN shifts s ON se.shift_id = s.id
+      LEFT JOIN warehouses w ON s.warehouse_id = w.id
+      WHERE se.employee_id = $1
+      ORDER BY s.date DESC
+    `, [req.params.id]);
+    res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/employee/:id/earnings", async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT COALESCE(SUM(se.hours_worked), 0) as total_hours,
+        COALESCE(SUM(se.hours_worked * e.hourly_rate), 0) as total_earnings
+      FROM shift_employees se
+      JOIN employees e ON se.employee_id = e.id
+      WHERE se.employee_id = $1
+    `, [req.params.id]);
+    res.json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/employee/:id/checkin", async (req, res) => {
+  try {
+    const { shift_id } = req.body;
+    const r = await pool.query(
+      "UPDATE shift_employees SET check_in_time=NOW(), status='checked_in' WHERE shift_id=$1 AND employee_id=$2 RETURNING *",
+      [shift_id, req.params.id]
+    );
+    res.json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/employee/:id/checkout", async (req, res) => {
+  try {
+    const { shift_id } = req.body;
+    const r = await pool.query(`
+      UPDATE shift_employees SET check_out_time=NOW(), status='completed',
+        hours_worked = EXTRACT(EPOCH FROM (NOW() - check_in_time))/3600
+      WHERE shift_id=$1 AND employee_id=$2 RETURNING *
+    `, [shift_id, req.params.id]);
+    res.json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Employee views warehouse pay rates (public rates only)
+app.get("/employee/warehouse-rates", async (req, res) => {
+  try {
+    const r = await pool.query("SELECT id, name, default_rate FROM warehouses WHERE status='active' ORDER BY name");
+    res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ========================
+// DASHBOARD STATS
+// ========================
+app.get("/admin/dashboard", async (req, res) => {
+  try {
+    const empCount = await pool.query("SELECT COUNT(*) as c FROM employees WHERE status='active'");
+    const shiftCount = await pool.query("SELECT COUNT(*) as c FROM shifts WHERE date >= CURRENT_DATE");
+    const containerCount = await pool.query("SELECT COUNT(*) as c FROM containers WHERE status='pending'");
+    const invoiceTotal = await pool.query("SELECT COALESCE(SUM(total),0) as t FROM invoices WHERE status='sent' OR status='draft'");
+    const pendingTimeOff = await pool.query("SELECT COUNT(*) as c FROM time_off_requests WHERE status='pending'");
     res.json({
-      year,
-      employees: data,
-      grand_total: grandTotal.toFixed(2),
-      note: 'Box 14 (Employment Income) on T4. CPP/EI/Tax amounts must come from your payroll service records.'
+      active_employees: parseInt(empCount.rows[0].c),
+      upcoming_shifts: parseInt(shiftCount.rows[0].c),
+      pending_containers: parseInt(containerCount.rows[0].c),
+      outstanding_invoices: parseFloat(invoiceTotal.rows[0].t),
+      pending_time_off: parseInt(pendingTimeOff.rows[0].c)
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Server running on port ' + PORT));
+app.listen(PORT, () => console.log(`ELS Backend running on port ${PORT}`));
