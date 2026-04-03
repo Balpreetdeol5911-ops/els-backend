@@ -546,5 +546,285 @@ app.get('/admin/migrate-columns', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ==================== WORKER DETAIL REPORTS ====================
+
+// Detailed worker report - full stats for a specific employee
+app.get('/admin/worker-report/:employee_id', auth, async (req, res) => {
+  try {
+    const eid = req.params.employee_id;
+    
+    // Employee info
+    const emp = (await pool.query('SELECT id,name,email,phone,sin_number,bank_account,bank_transit,bank_institution,address,city,province,postal_code,created_at FROM users WHERE id=$1', [eid])).rows[0];
+    if (!emp) return res.status(404).json({ error: 'Employee not found' });
+
+    // All-time stats
+    const allTime = (await pool.query(`
+      SELECT 
+        COUNT(*)::text as total_containers,
+        COALESCE(SUM(total_earning::numeric),0)::text as total_earned,
+        COALESCE(SUM(CASE WHEN payment_status='paid' THEN total_earning::numeric ELSE 0 END),0)::text as total_paid,
+        COALESCE(SUM(CASE WHEN payment_status IS NULL OR payment_status!='paid' THEN total_earning::numeric ELSE 0 END),0)::text as total_unpaid,
+        COALESCE(SUM(total_pieces),0)::text as total_pieces,
+        COALESCE(SUM(sku_count),0)::text as total_skus,
+        COALESCE(SUM(hours_worked),0)::text as total_hours,
+        COALESCE(AVG(CASE WHEN hours_worked > 0 THEN total_earning::numeric / hours_worked END),0)::text as avg_hourly_rate,
+        COALESCE(AVG(total_earning::numeric),0)::text as avg_per_container,
+        MIN(created_at)::text as first_container_date,
+        MAX(created_at)::text as last_container_date
+      FROM containers WHERE employee_id=$1 AND status='completed'
+    `, [eid])).rows[0];
+
+    // This week stats
+    const thisWeek = (await pool.query(`
+      SELECT 
+        COUNT(*)::text as containers,
+        COALESCE(SUM(total_earning::numeric),0)::text as earned,
+        COALESCE(SUM(hours_worked),0)::text as hours,
+        COALESCE(SUM(total_pieces),0)::text as pieces
+      FROM containers WHERE employee_id=$1 AND status='completed' AND created_at>=NOW()-INTERVAL '7 days'
+    `, [eid])).rows[0];
+
+    // This month stats
+    const thisMonth = (await pool.query(`
+      SELECT 
+        COUNT(*)::text as containers,
+        COALESCE(SUM(total_earning::numeric),0)::text as earned,
+        COALESCE(SUM(hours_worked),0)::text as hours,
+        COALESCE(SUM(total_pieces),0)::text as pieces
+      FROM containers WHERE employee_id=$1 AND status='completed' AND created_at>=date_trunc('month', NOW())
+    `, [eid])).rows[0];
+
+    // Container size breakdown
+    const sizeBreakdown = (await pool.query(`
+      SELECT container_size, COUNT(*)::text as count, COALESCE(SUM(total_earning::numeric),0)::text as earned
+      FROM containers WHERE employee_id=$1 AND status='completed'
+      GROUP BY container_size ORDER BY count DESC
+    `, [eid])).rows;
+
+    // Weekly earnings history (last 12 weeks)
+    const weeklyHistory = (await pool.query(`
+      SELECT 
+        date_trunc('week', created_at)::date::text as week_start,
+        COUNT(*)::text as containers,
+        COALESCE(SUM(total_earning::numeric),0)::text as earned,
+        COALESCE(SUM(hours_worked),0)::text as hours
+      FROM containers WHERE employee_id=$1 AND status='completed' AND created_at>=NOW()-INTERVAL '12 weeks'
+      GROUP BY date_trunc('week', created_at) ORDER BY week_start DESC
+    `, [eid])).rows;
+
+    // Recent containers (last 20)
+    const recentContainers = (await pool.query(`
+      SELECT c.*, s.shift_date, w.name as warehouse_name
+      FROM containers c 
+      LEFT JOIN shifts s ON c.shift_id=s.id 
+      LEFT JOIN warehouses w ON s.warehouse_id=w.id
+      WHERE c.employee_id=$1 AND c.status='completed'
+      ORDER BY c.created_at DESC LIMIT 20
+    `, [eid])).rows;
+
+    // Payroll records
+    const payrollHistory = (await pool.query('SELECT * FROM payroll_records WHERE employee_id=$1 ORDER BY paid_at DESC LIMIT 10', [eid])).rows;
+
+    res.json({
+      employee: emp,
+      all_time: allTime,
+      this_week: thisWeek,
+      this_month: thisMonth,
+      size_breakdown: sizeBreakdown,
+      weekly_history: weeklyHistory,
+      recent_containers: recentContainers,
+      payroll_history: payrollHistory
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Pay period summary with estimated deductions for all employees
+app.get('/admin/payroll/period-summary', auth, async (req, res) => {
+  try {
+    const { start_date, end_date } = req.query;
+    const startDate = start_date || new Date(Date.now() - 7*24*60*60*1000).toISOString().split('T')[0];
+    const endDate = end_date || new Date().toISOString().split('T')[0];
+
+    const employees = (await pool.query(`
+      SELECT 
+        u.id, u.name, u.email, u.phone, u.sin_number,
+        u.bank_account, u.bank_transit, u.bank_institution,
+        u.address, u.city, u.province, u.postal_code,
+        COUNT(c.id)::text as container_count,
+        COALESCE(SUM(c.hours_worked),0)::text as total_hours,
+        COALESCE(SUM(c.total_pieces),0)::text as total_pieces,
+        COALESCE(SUM(c.sku_count),0)::text as total_skus,
+        COALESCE(SUM(c.total_earning::numeric),0)::text as gross_pay,
+        COALESCE(SUM(CASE WHEN c.payment_status='paid' THEN c.total_earning::numeric ELSE 0 END),0)::text as already_paid,
+        COALESCE(SUM(CASE WHEN c.payment_status IS NULL OR c.payment_status!='paid' THEN c.total_earning::numeric ELSE 0 END),0)::text as unpaid
+      FROM users u
+      LEFT JOIN containers c ON c.employee_id=u.id 
+        AND c.status='completed' 
+        AND c.created_at >= $1::date 
+        AND c.created_at < ($2::date + interval '1 day')
+      WHERE u.role='employee'
+      GROUP BY u.id, u.name, u.email, u.phone, u.sin_number,
+        u.bank_account, u.bank_transit, u.bank_institution,
+        u.address, u.city, u.province, u.postal_code
+      ORDER BY u.name
+    `, [startDate, endDate])).rows;
+
+    // Add estimated deductions (2026 BC rates)
+    const CPP_RATE = 0.0595;
+    const CPP_BASIC_EXEMPTION_ANNUAL = 3500;
+    const EI_EMPLOYEE_RATE = 0.0163;
+    const EI_EMPLOYER_RATE = 0.02282; // 1.4x employee rate
+
+    const withDeductions = employees.map(emp => {
+      const grossPay = parseFloat(emp.gross_pay) || 0;
+      // Estimate CPP (simplified - per pay period)
+      const cppEmployee = Math.max(0, grossPay * CPP_RATE);
+      const cppEmployer = cppEmployee;
+      // Estimate EI
+      const eiEmployee = grossPay * EI_EMPLOYEE_RATE;
+      const eiEmployer = grossPay * EI_EMPLOYER_RATE;
+      // Rough federal+BC tax estimate (simplified for low income bracket)
+      const annualizedGross = grossPay * 52; // rough annualization
+      let estTaxRate = 0;
+      if (annualizedGross > 16129) { // above federal BPA
+        estTaxRate = 0.14 + 0.0506; // federal 14% + BC 5.06% lowest brackets
+      }
+      const incomeTax = Math.max(0, grossPay * estTaxRate);
+      const totalDeductions = cppEmployee + eiEmployee + incomeTax;
+      const netPay = grossPay - totalDeductions;
+      const employerCost = grossPay + cppEmployer + eiEmployer;
+
+      return {
+        ...emp,
+        estimated_cpp_employee: cppEmployee.toFixed(2),
+        estimated_cpp_employer: cppEmployer.toFixed(2),
+        estimated_ei_employee: eiEmployee.toFixed(2),
+        estimated_ei_employer: eiEmployer.toFixed(2),
+        estimated_income_tax: incomeTax.toFixed(2),
+        estimated_total_deductions: totalDeductions.toFixed(2),
+        estimated_net_pay: netPay.toFixed(2),
+        estimated_total_employer_cost: employerCost.toFixed(2)
+      };
+    });
+
+    // Totals
+    const totals = withDeductions.reduce((acc, emp) => {
+      acc.gross += parseFloat(emp.gross_pay) || 0;
+      acc.cpp_employee += parseFloat(emp.estimated_cpp_employee) || 0;
+      acc.cpp_employer += parseFloat(emp.estimated_cpp_employer) || 0;
+      acc.ei_employee += parseFloat(emp.estimated_ei_employee) || 0;
+      acc.ei_employer += parseFloat(emp.estimated_ei_employer) || 0;
+      acc.income_tax += parseFloat(emp.estimated_income_tax) || 0;
+      acc.net_pay += parseFloat(emp.estimated_net_pay) || 0;
+      acc.employer_cost += parseFloat(emp.estimated_total_employer_cost) || 0;
+      acc.hours += parseFloat(emp.total_hours) || 0;
+      acc.containers += parseInt(emp.container_count) || 0;
+      return acc;
+    }, { gross: 0, cpp_employee: 0, cpp_employer: 0, ei_employee: 0, ei_employer: 0, income_tax: 0, net_pay: 0, employer_cost: 0, hours: 0, containers: 0 });
+
+    res.json({
+      period: { start: startDate, end: endDate },
+      employees: withDeductions,
+      totals: {
+        gross_pay: totals.gross.toFixed(2),
+        cpp_employee: totals.cpp_employee.toFixed(2),
+        cpp_employer: totals.cpp_employer.toFixed(2),
+        ei_employee: totals.ei_employee.toFixed(2),
+        ei_employer: totals.ei_employer.toFixed(2),
+        income_tax: totals.income_tax.toFixed(2),
+        net_pay: totals.net_pay.toFixed(2),
+        total_employer_cost: totals.employer_cost.toFixed(2),
+        total_hours: totals.hours.toFixed(1),
+        total_containers: totals.containers
+      },
+      note: 'Deduction estimates use 2026 BC rates. Use CRA PDOC calculator or payroll service for exact amounts.'
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// CSV export of payroll data for import into payroll service
+app.get('/admin/payroll/export-csv', auth, async (req, res) => {
+  try {
+    const { start_date, end_date } = req.query;
+    const startDate = start_date || new Date(Date.now() - 7*24*60*60*1000).toISOString().split('T')[0];
+    const endDate = end_date || new Date().toISOString().split('T')[0];
+
+    const data = (await pool.query(`
+      SELECT 
+        u.name as employee_name,
+        u.email,
+        u.phone,
+        u.sin_number,
+        u.bank_institution,
+        u.bank_transit,
+        u.bank_account,
+        u.address,
+        u.city,
+        u.province,
+        u.postal_code,
+        COUNT(c.id) as containers_worked,
+        COALESCE(SUM(c.hours_worked),0) as total_hours,
+        COALESCE(SUM(c.total_pieces),0) as total_pieces,
+        COALESCE(SUM(c.sku_count),0) as total_skus,
+        COALESCE(SUM(c.total_earning::numeric),0) as gross_earnings
+      FROM users u
+      LEFT JOIN containers c ON c.employee_id=u.id 
+        AND c.status='completed' 
+        AND c.created_at >= $1::date 
+        AND c.created_at < ($2::date + interval '1 day')
+      WHERE u.role='employee'
+      GROUP BY u.id, u.name, u.email, u.phone, u.sin_number,
+        u.bank_institution, u.bank_transit, u.bank_account,
+        u.address, u.city, u.province, u.postal_code
+      HAVING COALESCE(SUM(c.total_earning::numeric),0) > 0
+      ORDER BY u.name
+    `, [startDate, endDate])).rows;
+
+    // Build CSV
+    const headers = 'Employee Name,Email,Phone,SIN,Bank Institution,Bank Transit,Bank Account,Address,City,Province,Postal Code,Containers Worked,Total Hours,Total Pieces,Total SKUs,Gross Earnings\n';
+    const rows = data.map(r => 
+      `"${r.employee_name}","${r.email}","${r.phone || ''}","${r.sin_number || ''}","${r.bank_institution || ''}","${r.bank_transit || ''}","${r.bank_account || ''}","${r.address || ''}","${r.city || ''}","${r.province || ''}","${r.postal_code || ''}",${r.containers_worked},${r.total_hours},${r.total_pieces},${r.total_skus},${r.gross_earnings}`
+    ).join('\n');
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename=els-payroll-${startDate}-to-${endDate}.csv`);
+    res.send(headers + rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// T4 year-end summary per employee
+app.get('/admin/t4-summary/:year', auth, async (req, res) => {
+  try {
+    const year = req.params.year;
+    const data = (await pool.query(`
+      SELECT 
+        u.id, u.name, u.email, u.sin_number,
+        u.address, u.city, u.province, u.postal_code,
+        COUNT(c.id)::text as total_containers,
+        COALESCE(SUM(c.hours_worked),0)::text as total_hours,
+        COALESCE(SUM(c.total_earning::numeric),0)::text as total_employment_income,
+        COALESCE(SUM(CASE WHEN c.payment_status='paid' THEN c.total_earning::numeric ELSE 0 END),0)::text as total_paid,
+        COALESCE(SUM(CASE WHEN c.payment_status IS NULL OR c.payment_status!='paid' THEN c.total_earning::numeric ELSE 0 END),0)::text as total_unpaid
+      FROM users u
+      LEFT JOIN containers c ON c.employee_id=u.id 
+        AND c.status='completed'
+        AND EXTRACT(YEAR FROM c.created_at) = $1
+      WHERE u.role='employee'
+      GROUP BY u.id, u.name, u.email, u.sin_number, u.address, u.city, u.province, u.postal_code
+      HAVING COALESCE(SUM(c.total_earning::numeric),0) > 0
+      ORDER BY u.name
+    `, [year])).rows;
+
+    const grandTotal = data.reduce((sum, d) => sum + (parseFloat(d.total_employment_income) || 0), 0);
+
+    res.json({
+      year,
+      employees: data,
+      grand_total: grandTotal.toFixed(2),
+      note: 'Box 14 (Employment Income) on T4. CPP/EI/Tax amounts must come from your payroll service records.'
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Server running on port ' + PORT));
