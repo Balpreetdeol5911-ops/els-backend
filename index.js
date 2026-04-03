@@ -52,12 +52,17 @@ async function migrateDB() {
 
 setupDB().then(() => migrateDB());
 
+// Health check
+app.get('/', (req, res) => { res.json({ status: 'ELS Backend running', version: '2.0.0' }); });
+
 function auth(req, res, next) {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'No token' });
   try { req.user = jwt.verify(token, JWT_SECRET); next(); }
   catch { res.status(401).json({ error: 'Invalid token' }); }
 }
+
+// ==================== AUTH ====================
 
 app.post('/auth/login', async (req, res) => {
   try {
@@ -72,6 +77,8 @@ app.post('/auth/login', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ==================== USERS (self) ====================
+
 app.post('/users', auth, async (req, res) => {
   try {
     const { name, email, password, phone } = req.body;
@@ -79,6 +86,41 @@ app.post('/users', auth, async (req, res) => {
     const result = await pool.query('INSERT INTO users (name, email, password, role, phone) VALUES ($1,$2,$3,$4,$5) RETURNING *', [name, email, hash, 'employee', phone]);
     const { password: _, ...user } = result.rows[0];
     res.json(user);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/users/me', auth, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT id,name,email,role,phone,sin_number,bank_account,bank_transit,bank_institution,address,city,province,postal_code FROM users WHERE id=$1', [req.user.id]);
+    if (!result.rows[0]) return res.status(404).json({ error: 'User not found' });
+    res.json(result.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/users/me', auth, async (req, res) => {
+  try {
+    const { name, email, phone } = req.body;
+    res.json((await pool.query('UPDATE users SET name=$1,email=$2,phone=$3 WHERE id=$4 RETURNING id,name,email,role,phone,sin_number,bank_account,bank_transit,bank_institution,address,city,province,postal_code', [name, email, phone, req.user.id])).rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/users/me/banking', auth, async (req, res) => {
+  try {
+    const { sin_number, bank_account, bank_transit, bank_institution, address, city, province, postal_code } = req.body;
+    res.json((await pool.query('UPDATE users SET sin_number=$1,bank_account=$2,bank_transit=$3,bank_institution=$4,address=$5,city=$6,province=$7,postal_code=$8 WHERE id=$9 RETURNING id,name,email,role,phone,sin_number,bank_account,bank_transit,bank_institution,address,city,province,postal_code', [sin_number, bank_account, bank_transit, bank_institution, address, city, province, postal_code, req.user.id])).rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/users/me/password', auth, async (req, res) => {
+  try {
+    const { current_password, new_password } = req.body;
+    const user = (await pool.query('SELECT password FROM users WHERE id=$1', [req.user.id])).rows[0];
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const valid = await bcrypt.compare(current_password, user.password);
+    if (!valid) return res.status(401).json({ error: 'Current password is incorrect' });
+    const hash = await bcrypt.hash(new_password, 10);
+    await pool.query('UPDATE users SET password=$1 WHERE id=$2', [hash, req.user.id]);
+    res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -105,6 +147,8 @@ app.put('/users/:id/banking', auth, async (req, res) => {
     res.json((await pool.query('UPDATE users SET sin_number=$1,bank_account=$2,bank_transit=$3,bank_institution=$4,address=$5,city=$6,province=$7,postal_code=$8 WHERE id=$9 RETURNING *', [sin_number, bank_account, bank_transit, bank_institution, address, city, province, postal_code, req.params.id])).rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+// ==================== ADMIN EMPLOYEES ====================
 
 app.get('/admin/employees', auth, async (req, res) => {
   try { res.json((await pool.query("SELECT id,name,email,role,phone,sin_number,bank_account,bank_transit,bank_institution,address,city,province,postal_code FROM users WHERE role='employee' ORDER BY name")).rows); }
@@ -143,6 +187,9 @@ app.delete('/admin/employees/:id', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ==================== WAREHOUSES ====================
+// FIX: Warehouse delete now handles shifts/containers referencing this warehouse
+
 app.post('/warehouses', auth, async (req, res) => {
   try {
     const { name, address, base_pay_20ft, base_pay_40ft, base_pay_45ft, base_pay_53ft, piece_bonus, sku_bonus, wait_time_pay, piece_bonus_min, sku_bonus_min } = req.body;
@@ -167,16 +214,43 @@ app.put('/warehouses/:id', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// FIXED: Cascade delete warehouse - removes shifts, their containers, and assignments first
 app.delete('/warehouses/:id', auth, async (req, res) => {
-  try { await pool.query('DELETE FROM warehouses WHERE id=$1', [req.params.id]); res.json({ success: true }); }
-  catch (e) { res.status(500).json({ error: e.message }); }
+  try {
+    // Get all shifts for this warehouse
+    const shifts = await pool.query('SELECT id FROM shifts WHERE warehouse_id=$1', [req.params.id]);
+    const shiftIds = shifts.rows.map(s => s.id);
+    if (shiftIds.length > 0) {
+      // Check if any containers are completed/paid - warn if so
+      const completedCheck = await pool.query(
+        "SELECT COUNT(*) as cnt FROM containers WHERE shift_id=ANY($1) AND status='completed'",
+        [shiftIds]
+      );
+      // Delete containers that are only planned (not completed/paid)
+      await pool.query("DELETE FROM containers WHERE shift_id=ANY($1) AND status IN ('planned','active','checked_in','in_progress')", [shiftIds]);
+      // Nullify shift_id on completed containers so earnings are preserved
+      await pool.query("UPDATE containers SET shift_id=NULL WHERE shift_id=ANY($1) AND status='completed'", [shiftIds]);
+      // Delete shift assignments
+      await pool.query('DELETE FROM shift_assignments WHERE shift_id=ANY($1)', [shiftIds]);
+      // Delete shifts
+      await pool.query('DELETE FROM shifts WHERE warehouse_id=$1', [req.params.id]);
+    }
+    await pool.query('DELETE FROM warehouses WHERE id=$1', [req.params.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+// ==================== SHIFTS ====================
 
 app.post('/shifts', auth, async (req, res) => {
   try {
     const { warehouse_id, shift_date, start_time, notes, employee_ids } = req.body;
     const shift = await pool.query('INSERT INTO shifts (warehouse_id,shift_date,start_time,notes) VALUES ($1,$2,$3,$4) RETURNING *', [warehouse_id, shift_date, start_time, notes]);
-    if (employee_ids?.length) { for (const eid of employee_ids) { await pool.query('INSERT INTO shift_assignments (shift_id,employee_id) VALUES ($1,$2)', [shift.rows[0].id, eid]); } }
+    if (employee_ids?.length) {
+      for (const eid of employee_ids) {
+        await pool.query('INSERT INTO shift_assignments (shift_id,employee_id) VALUES ($1,$2)', [shift.rows[0].id, eid]);
+      }
+    }
     res.json(shift.rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -208,23 +282,33 @@ app.put('/shifts/:id', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// FIXED: Delete shift - preserve completed container earnings
 app.delete('/shifts/:id', auth, async (req, res) => {
   try {
-    await pool.query('DELETE FROM containers WHERE shift_id=$1', [req.params.id]);
+    // Nullify shift_id on completed containers so earnings are NOT deleted
+    await pool.query("UPDATE containers SET shift_id=NULL WHERE shift_id=$1 AND status='completed'", [req.params.id]);
+    // Delete non-completed containers
+    await pool.query("DELETE FROM containers WHERE shift_id=$1 AND status!='completed'", [req.params.id]);
     await pool.query('DELETE FROM shift_assignments WHERE shift_id=$1', [req.params.id]);
     await pool.query('DELETE FROM shifts WHERE id=$1', [req.params.id]);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// FIXED: Force delete shift - same earnings preservation
 app.delete('/shifts/:id/force', auth, async (req, res) => {
   try {
-    await pool.query("DELETE FROM containers WHERE shift_id=$1 AND status='planned'", [req.params.id]);
+    // Preserve completed container earnings
+    await pool.query("UPDATE containers SET shift_id=NULL WHERE shift_id=$1 AND status='completed'", [req.params.id]);
+    // Delete non-completed containers
+    await pool.query("DELETE FROM containers WHERE shift_id=$1", [req.params.id]);
     await pool.query('DELETE FROM shift_assignments WHERE shift_id=$1', [req.params.id]);
     await pool.query('DELETE FROM shifts WHERE id=$1', [req.params.id]);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+// ==================== SHIFT ASSIGNMENTS ====================
 
 app.get('/my-shifts', auth, async (req, res) => {
   try { res.json((await pool.query('SELECT s.*,w.name as warehouse_name,sa.status as assignment_status FROM shifts s JOIN shift_assignments sa ON s.id=sa.shift_id LEFT JOIN warehouses w ON s.warehouse_id=w.id WHERE sa.employee_id=$1 ORDER BY s.shift_date DESC', [req.user.id])).rows); }
@@ -233,7 +317,14 @@ app.get('/my-shifts', auth, async (req, res) => {
 
 app.get('/my-active-shifts-v2', auth, async (req, res) => {
   try {
-    res.json((await pool.query("SELECT s.*,w.name as warehouse_name,w.address as warehouse_address,sa.status as assignment_status,COUNT(c.id)::text as total_containers,COUNT(CASE WHEN c.status='completed' THEN 1 END)::text as completed_containers,COUNT(sa2.id)::text as employee_count FROM shifts s JOIN shift_assignments sa ON sa.shift_id=s.id AND sa.employee_id=$1 JOIN warehouses w ON s.warehouse_id=w.id LEFT JOIN containers c ON c.shift_id=s.id LEFT JOIN shift_assignments sa2 ON sa2.shift_id=s.id WHERE sa.status!='rejected' GROUP BY s.id,w.name,w.address,sa.status HAVING COUNT(c.id)=0 OR COUNT(CASE WHEN c.status!='completed' THEN 1 END)>0 ORDER BY s.shift_date DESC", [req.user.id])).rows);
+    res.json((await pool.query("SELECT s.*,w.name as warehouse_name,w.address as warehouse_address,sa.status as assignment_status,COUNT(c.id)::text as total_containers,COUNT(CASE WHEN c.status='completed' THEN 1 END)::text as completed_containers,COUNT(sa2.id)::text as employee_count FROM shifts s JOIN shift_assignments sa ON sa.shift_id=s.id AND sa.employee_id=$1 JOIN warehouses w ON s.warehouse_id=w.id LEFT JOIN containers c ON c.shift_id=s.id LEFT JOIN shift_assignments sa2 ON sa2.shift_id=s.id WHERE sa.status!='rejected' GROUP BY s.id,w.name,w.address,sa.status ORDER BY s.shift_date DESC", [req.user.id])).rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Employee's completed/past shifts
+app.get('/my-completed-shifts', auth, async (req, res) => {
+  try {
+    res.json((await pool.query("SELECT s.*,w.name as warehouse_name,w.address as warehouse_address,sa.status as assignment_status,COUNT(c.id)::text as total_containers,COUNT(CASE WHEN c.status='completed' THEN 1 END)::text as completed_containers FROM shifts s JOIN shift_assignments sa ON sa.shift_id=s.id AND sa.employee_id=$1 JOIN warehouses w ON s.warehouse_id=w.id LEFT JOIN containers c ON c.shift_id=s.id WHERE sa.status='confirmed' GROUP BY s.id,w.name,w.address,sa.status HAVING COUNT(c.id)>0 AND COUNT(c.id)=COUNT(CASE WHEN c.status='completed' THEN 1 END) ORDER BY s.shift_date DESC LIMIT 30", [req.user.id])).rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -247,10 +338,14 @@ app.put('/shift-assignments/:shift_id/respond', auth, async (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ==================== CONTAINERS ====================
+
 app.post('/shifts/:id/containers', auth, async (req, res) => {
   try {
     const inserted = [];
-    for (const c of req.body.containers) { inserted.push((await pool.query('INSERT INTO containers (shift_id,container_number,container_size,status) VALUES ($1,$2,$3,$4) RETURNING *', [req.params.id, c.container_number, c.container_size, 'planned'])).rows[0]); }
+    for (const c of req.body.containers) {
+      inserted.push((await pool.query('INSERT INTO containers (shift_id,container_number,container_size,status) VALUES ($1,$2,$3,$4) RETURNING *', [req.params.id, c.container_number, c.container_size, 'planned'])).rows[0]);
+    }
     res.json(inserted);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -368,6 +463,8 @@ app.put('/containers/:id/checkout/v2', auth, async (req, res) => {
   } catch (e) { console.log('V2 CHECKOUT ERROR:', e.message, e.stack); res.status(500).json({ error: e.message }); }
 });
 
+// ==================== EARNINGS ====================
+
 app.get('/earnings/weekly', auth, async (req, res) => {
   try { res.json((await pool.query("SELECT COALESCE(SUM(total_earning::numeric),0) as total,COUNT(*) as containers FROM containers WHERE employee_id=$1 AND created_at>=NOW()-INTERVAL '7 days' AND status='completed'", [req.user.id])).rows[0]); }
   catch (e) { res.status(500).json({ error: e.message }); }
@@ -377,6 +474,8 @@ app.get('/earnings/detail/:employee_id', auth, async (req, res) => {
   try { res.json((await pool.query('SELECT c.*,s.shift_date,w.name as warehouse_name FROM containers c LEFT JOIN shifts s ON c.shift_id=s.id LEFT JOIN warehouses w ON s.warehouse_id=w.id WHERE c.employee_id=$1 ORDER BY c.created_at DESC', [req.params.employee_id])).rows); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+// ==================== PAYROLL ====================
 
 app.get('/admin/payroll/weekly', auth, async (req, res) => {
   try {
@@ -418,6 +517,8 @@ app.get('/payroll/history/:employee_id', auth, async (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ==================== DASHBOARD ====================
+
 app.get('/admin/dashboard', auth, async (req, res) => {
   try {
     const ac = await pool.query("SELECT c.*,u.name as employee_name,w.name as warehouse_name FROM containers c LEFT JOIN users u ON c.employee_id=u.id LEFT JOIN shifts s ON c.shift_id=s.id LEFT JOIN warehouses w ON s.warehouse_id=w.id WHERE c.status IN ('checked_in','in_progress') ORDER BY c.checkin_time DESC");
@@ -427,6 +528,8 @@ app.get('/admin/dashboard', auth, async (req, res) => {
     res.json({ active_containers: ac.rows, weekly_stats: ws.rows[0], today_shifts: ts.rows, top_earners: te.rows });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+// ==================== MIGRATION UTILITY ====================
 
 app.get('/admin/migrate-columns', async (req, res) => {
   try {
